@@ -412,7 +412,41 @@ async function handleUpdate(update) {
   }
 
   if (!activeChild) {
-    return sendText(chatId, "Please set an active child first: /use <name> (or /addchild <name>).");
+    if (text === MENU.WORD || text === MENU.PASSAGE || text === MENU.QUIZ) {
+      await updateSession(userId, { mode: "awaiting_child_name", pending_action: text });
+      return sendText(chatId, "Avval bolaning ismini kiriting:", { remove_keyboard: true });
+    }
+
+    if (session.mode === "awaiting_child_name" && text) {
+      const name = text.trim();
+      if (!name) return sendText(chatId, "Iltimos, ism kiriting:");
+      await query(
+        `INSERT INTO children (telegram_user_id, name) VALUES ($1, $2)
+         ON CONFLICT (telegram_user_id, name) DO NOTHING`,
+        [userId, name]
+      );
+      const rows = await query("SELECT id FROM children WHERE telegram_user_id=$1 AND name=$2", [userId, name]);
+      const childId = rows[0].id;
+      const pending = session.pending_action;
+      await updateSession(userId, { active_child_id: childId, pending_action: null });
+
+      if (pending === MENU.QUIZ) {
+        await updateSession(userId, { mode: "quiz_choose_type" });
+        return sendText(chatId, "Is this a small booklet (whole book) or a big book (specific pages)?", bookTypeKeyboard);
+      }
+      if (pending === MENU.WORD) {
+        await updateSession(userId, { mode: "awaiting_word" });
+        return sendText(chatId, "Type the word you'd like explained:");
+      }
+      if (pending === MENU.PASSAGE) {
+        await updateSession(userId, { mode: "awaiting_passage" });
+        return sendText(chatId, "Send the passage as text, or a photo of it:");
+      }
+      await updateSession(userId, { mode: "idle" });
+      return sendMenu(chatId, `✅ "${name}" qo'shildi va faol qilib belgilandi.`);
+    }
+
+    return sendText(chatId, "Please set an active child first: /use <name> (or /addchild <name>), or tap a menu option below.", mainMenuKeyboard);
   }
 
   // ---- Resume check ----
