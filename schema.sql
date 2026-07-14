@@ -20,6 +20,14 @@ CREATE TABLE IF NOT EXISTS sessions (
   quiz_answers_json TEXT
 );
 
+-- New columns for menu + cover-photo quiz flow (safe on existing deployed DBs)
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS quiz_book_type TEXT;
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS quiz_author TEXT;
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS quiz_page INTEGER;
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS quiz_found BOOLEAN;
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS quiz_page_range TEXT;
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS quiz_photos_json TEXT;
+
 CREATE TABLE IF NOT EXISTS books (
   id SERIAL PRIMARY KEY,
   child_id INTEGER NOT NULL,
@@ -28,6 +36,8 @@ CREATE TABLE IF NOT EXISTS books (
   created_at TIMESTAMP DEFAULT NOW(),
   UNIQUE(child_id, title)
 );
+
+ALTER TABLE books ADD COLUMN IF NOT EXISTS last_page_range TEXT;
 
 CREATE TABLE IF NOT EXISTS chapter_records (
   id SERIAL PRIMARY KEY,
