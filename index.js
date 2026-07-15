@@ -98,6 +98,24 @@ async function explainImage(base64Image, mediaType, isPassage) {
   ]);
 }
 
+async function checkImageReadable(base64Image, mediaType, context) {
+  const prompt = `Look at this photo${context ? ` (${context})` : ""}. Judge only image quality — is the text in it clearly legible (in focus, well lit, not cut off, not too small/blurry to read)? This is NOT about whether the content makes sense, only whether a human could read the words. Respond ONLY with valid JSON, no markdown fences, no preamble: {"readable": true, "reason": ""} or {"readable": false, "reason": "short child-friendly reason, e.g. 'the photo is too blurry' or 'it's too dark to read'"}.`;
+  const raw = await callClaude([
+    { role: "user", content: [
+      { type: "image", source: { type: "base64", media_type: mediaType, data: base64Image } },
+      { type: "text", text: prompt },
+    ]},
+  ], 300);
+  const clean = raw.replace(/```json|```/g, "").trim();
+  try {
+    const parsed = JSON.parse(clean);
+    return { readable: parsed.readable !== false, reason: parsed.reason || "" };
+  } catch (e) {
+    console.error("Failed to parse readability JSON:", clean);
+    return { readable: true, reason: "" }; // fail open so a parsing hiccup doesn't block a real photo
+  }
+}
+
 async function extractBookInfo(base64Image, mediaType) {
   const prompt = 'Look at this photo of a book cover. Identify the title and author if visible. Respond ONLY with valid JSON, no markdown fences, no preamble: {"title": "...", "author": "..."} (use empty string for author if not visible/unknown).';
   const raw = await callClaude([
@@ -481,8 +499,8 @@ async function handleUpdate(update) {
   }
 
   if (text === MENU.QUIZ) {
-    await updateSession(userId, { mode: "quiz_choose_type" });
-    return sendText(chatId, "Is this a small booklet (whole book) or a big book (specific pages)?", bookTypeKeyboard);
+    await updateSession(userId, { mode: "quiz_awaiting_name" });
+    return sendText(chatId, `Who is taking this quiz? Type their name (e.g. "${activeChild.name}" or a different child):`, { remove_keyboard: true });
   }
 
   // ---- State machine ----
@@ -498,6 +516,10 @@ async function handleUpdate(update) {
     if (message.photo) {
       const largestPhoto = message.photo[message.photo.length - 1];
       const base64 = await getTelegramFileBase64(largestPhoto.file_id);
+      const quality = await checkImageReadable(base64, "image/jpeg", "a passage from a book");
+      if (!quality.readable) {
+        return sendText(chatId, `📷 That photo isn't clear enough to read${quality.reason ? ` (${quality.reason})` : ""}. Please retake it and send again.`);
+      }
       const explanation = await explainImage(base64, "image/jpeg", true);
       await query("INSERT INTO explain_log (child_id, content_type, query_text, response_text) VALUES ($1,'image','[photo passage]',$2)", [activeChild.id, explanation]);
       await updateSession(userId, { mode: "idle" });
@@ -509,6 +531,32 @@ async function handleUpdate(update) {
       await updateSession(userId, { mode: "idle" });
       return sendMenu(chatId, explanation);
     }
+  }
+
+  if (session.mode === "quiz_awaiting_name" && text) {
+    const name = text.trim();
+    if (!name) return sendText(chatId, "Please type a name:");
+    await query(
+      `INSERT INTO children (telegram_user_id, name) VALUES ($1, $2)
+       ON CONFLICT (telegram_user_id, name) DO NOTHING`,
+      [userId, name]
+    );
+    const rows = await query("SELECT * FROM children WHERE telegram_user_id=$1 AND name=$2", [userId, name]);
+    const quizChild = rows[0];
+    await updateSession(userId, { active_child_id: quizChild.id, mode: "idle" });
+
+    const inProgress = await getInProgressBook(quizChild.id);
+    if (inProgress) {
+      const nextEnd = (inProgress.last_page || 0) + RESUME_PAGE_INCREMENT;
+      await updateSession(userId, { mode: "resume_check", quiz_book_title: inProgress.title });
+      return sendText(
+        chatId,
+        `Welcome back, ${quizChild.name}! You're at page ${inProgress.last_page} of "${inProgress.title}". Have you read up to page ${nextEnd} (the next ${RESUME_PAGE_INCREMENT} pages)?`,
+        resumeKeyboard
+      );
+    }
+    await updateSession(userId, { mode: "quiz_choose_type" });
+    return sendText(chatId, "Is this a small booklet (whole book) or a big book (specific pages)?", bookTypeKeyboard);
   }
 
   if (session.mode === "quiz_choose_type") {
@@ -523,6 +571,10 @@ async function handleUpdate(update) {
   if (session.mode === "quiz_awaiting_cover" && message.photo) {
     const largestPhoto = message.photo[message.photo.length - 1];
     const base64 = await getTelegramFileBase64(largestPhoto.file_id);
+    const quality = await checkImageReadable(base64, "image/jpeg", "a book cover");
+    if (!quality.readable) {
+      return sendText(chatId, `📷 That photo isn't clear enough to read${quality.reason ? ` (${quality.reason})` : ""}. Please retake it in good light and send again.`);
+    }
     const info = await extractBookInfo(base64, "image/jpeg");
     await sendText(chatId, `Looking up "${info.title}"...`);
     const searchResult = await searchBookOnline(info.title, info.author);
@@ -599,6 +651,10 @@ async function handleUpdate(update) {
     if (message.photo) {
       const largestPhoto = message.photo[message.photo.length - 1];
       const base64 = await getTelegramFileBase64(largestPhoto.file_id);
+      const quality = await checkImageReadable(base64, "image/jpeg", "a page from a book");
+      if (!quality.readable) {
+        return sendText(chatId, `📷 That page isn't clear enough to read${quality.reason ? ` (${quality.reason})` : ""}. Please retake the photo (good light, hold steady, fill the frame) and send it again.`);
+      }
       const photos = JSON.parse(session.quiz_photos_json || "[]");
       photos.push({ base64, mediaType: "image/jpeg" });
       await updateSession(userId, { quiz_photos_json: JSON.stringify(photos) });
