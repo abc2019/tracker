@@ -47,7 +47,11 @@ async function tg(method, params) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(params),
   });
-  return res.json();
+  const data = await res.json();
+  if (!data.ok) {
+    console.error(`Telegram API error on ${method}:`, JSON.stringify(data), "params:", JSON.stringify(params));
+  }
+  return data;
 }
 
 function sendText(chatId, text, replyMarkup) {
@@ -381,6 +385,7 @@ async function handleUpdate(update) {
   const userId = String(message.from.id);
   const session = await getOrCreateSession(userId);
   const text = message.text?.trim();
+  console.log(`[update] userId=${userId} text=${JSON.stringify(text)} session.mode=${session.mode} active_child_id=${session.active_child_id}`);
 
   if (text?.startsWith("/start")) {
     await ensureChildren(userId);
@@ -796,6 +801,11 @@ async function handleUpdate(update) {
   if (session.mode === "idle") {
     return sendMenu(chatId, "Please choose an option below 👇");
   }
+
+  // Safety net: no branch matched (e.g. a stale/unknown session mode) — never fail silently.
+  console.log(`[unmatched state] userId=${userId} mode=${session.mode} text=${JSON.stringify(text)}`);
+  await updateSession(userId, { mode: "idle" });
+  return sendMenu(chatId, "Let's start fresh — please choose an option below 👇");
 }
 
 async function askQuizQuestion(chatId, questions, idx) {
