@@ -25,10 +25,19 @@ const RESUME = {
   YES: "✅ Yes, quiz me",
   NOT_YET: "📖 Not yet",
 };
+const FINISHED = {
+  YES: "✅ Ha, tugatdim",
+  NO: "📖 Yo'q, davom etyapman",
+};
+
+// Fixed set of children — pre-registered on /start, selected via buttons.
+const CHILD_NAMES = ["Hanifa", "Ismail"];
 
 const mainMenuKeyboard = { keyboard: [[MENU.WORD, MENU.PASSAGE], [MENU.QUIZ]], resize_keyboard: true };
 const bookTypeKeyboard = { keyboard: [[BOOK_TYPE.SMALL], [BOOK_TYPE.BIG]], resize_keyboard: true, one_time_keyboard: true };
 const resumeKeyboard = { keyboard: [[RESUME.YES], [RESUME.NOT_YET]], resize_keyboard: true, one_time_keyboard: true };
+const childKeyboard = { keyboard: [CHILD_NAMES], resize_keyboard: true, one_time_keyboard: true };
+const finishedKeyboard = { keyboard: [[FINISHED.YES], [FINISHED.NO]], resize_keyboard: true, one_time_keyboard: true };
 
 // ---------- Telegram helpers ----------
 
@@ -246,6 +255,39 @@ async function getChildren(userId) {
   return query("SELECT * FROM children WHERE telegram_user_id = $1 ORDER BY name", [userId]);
 }
 
+// Registers the fixed set of children (Hanifa, Ismail) for this telegram user if not already present.
+async function ensureChildren(userId) {
+  for (const name of CHILD_NAMES) {
+    await query(
+      `INSERT INTO children (telegram_user_id, name) VALUES ($1, $2)
+       ON CONFLICT (telegram_user_id, name) DO NOTHING`,
+      [userId, name]
+    );
+  }
+}
+
+async function getChildByName(userId, name) {
+  const rows = await query("SELECT * FROM children WHERE telegram_user_id=$1 AND name=$2", [userId, name]);
+  return rows[0] || null;
+}
+
+// If the child has a book in progress, prompts them to confirm they've read the next chunk
+// and puts the session into resume_check mode. Returns true if that prompt was sent.
+async function checkResumeOrPrompt(chatId, userId, child) {
+  const inProgress = await getInProgressBook(child.id);
+  if (inProgress) {
+    const nextEnd = (inProgress.last_page || 0) + RESUME_PAGE_INCREMENT;
+    await updateSession(userId, { mode: "resume_check", quiz_book_title: inProgress.title });
+    await sendText(
+      chatId,
+      `Welcome back, ${child.name}! You're at page ${inProgress.last_page} of "${inProgress.title}". Have you read up to page ${nextEnd} (the next ${RESUME_PAGE_INCREMENT} pages)?`,
+      resumeKeyboard
+    );
+    return true;
+  }
+  return false;
+}
+
 async function getActiveChild(session) {
   if (!session.active_child_id) return null;
   const rows = await query("SELECT * FROM children WHERE id = $1", [session.active_child_id]);
@@ -260,19 +302,28 @@ async function getInProgressBook(childId) {
   return rows[0] || null;
 }
 
-async function upsertBookProgress(childId, title, { author, foundOnline, bookType, pageRangeText, lastPage } = {}) {
-  await query(
-    `INSERT INTO books (child_id, title, author, found_online, book_type, last_page_range, last_page, updated_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+async function upsertBookProgress(childId, title, { author, foundOnline, bookType, pageRangeText, lastPage, totalPages } = {}) {
+  const rows = await query(
+    `INSERT INTO books (child_id, title, author, found_online, book_type, last_page_range, last_page, total_pages, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
      ON CONFLICT (child_id, title) DO UPDATE SET
        author = COALESCE(EXCLUDED.author, books.author),
        found_online = COALESCE(EXCLUDED.found_online, books.found_online),
        book_type = COALESCE(EXCLUDED.book_type, books.book_type),
        last_page_range = COALESCE(EXCLUDED.last_page_range, books.last_page_range),
        last_page = COALESCE(EXCLUDED.last_page, books.last_page),
-       updated_at = NOW()`,
-    [childId, title, author || null, foundOnline ?? null, bookType || null, pageRangeText || null, lastPage ?? null]
+       total_pages = COALESCE(EXCLUDED.total_pages, books.total_pages),
+       status = CASE
+         WHEN COALESCE(EXCLUDED.total_pages, books.total_pages) IS NOT NULL
+              AND COALESCE(EXCLUDED.last_page, books.last_page) >= COALESCE(EXCLUDED.total_pages, books.total_pages)
+         THEN 'finished'
+         ELSE books.status
+       END,
+       updated_at = NOW()
+     RETURNING status`,
+    [childId, title, author || null, foundOnline ?? null, bookType || null, pageRangeText || null, lastPage ?? null, totalPages ?? null]
   );
+  return rows[0]?.status || "in_progress";
 }
 
 // ---------- Webhook route ----------
@@ -289,12 +340,12 @@ app.post("/webhook", async (req, res) => {
 app.get("/", (req, res) => res.send("Reading Tracker Bot is running."));
 
 async function startQuizFromKnownBook(chatId, userId, activeChild, book) {
-  const nextEnd = (book.last_page || 0) + RESUME_PAGE_INCREMENT;
-  const pageRange = `${(book.last_page || 0) + 1}-${nextEnd}`;
   await sendText(chatId, "Great! Generating your quiz, one moment...");
   const previousQuestions = await getPreviousQuestions(activeChild.id, book.title);
 
   if (book.found_online) {
+    const nextEnd = (book.last_page || 0) + RESUME_PAGE_INCREMENT;
+    const pageRange = `${(book.last_page || 0) + 1}-${nextEnd}`;
     const questions = await generateQuizFromKnowledge(book.title, book.author, pageRange, previousQuestions);
     if (!questions || !questions.length) {
       await updateSession(userId, { mode: "idle" });
@@ -314,10 +365,12 @@ async function startQuizFromKnownBook(chatId, userId, activeChild, book) {
     await updateSession(userId, {
       mode: "quiz_collecting_photos",
       quiz_book_title: book.title,
-      quiz_page_range: pageRange,
       quiz_photos_json: "[]",
     });
-    return sendText(chatId, `Please send photos of pages ${pageRange}. Type 'done' when finished.`);
+    return sendText(
+      chatId,
+      `Iltimos, keyingi o'qigan sahifalaringizni birma-bir rasmga tushirib yuboring (kamida ${MIN_PAGES_BIG_BOOK} ta bet). Tugatgach "done" deb yozing.`
+    );
   }
 }
 
@@ -330,14 +383,12 @@ async function handleUpdate(update) {
   const text = message.text?.trim();
 
   if (text?.startsWith("/start")) {
-    return sendMenu(
+    await ensureChildren(userId);
+    await updateSession(userId, { mode: "awaiting_child_select", pending_action: null });
+    return sendText(
       chatId,
-      "📚 Welcome to the Reading Tracker Bot!\n\n" +
-        "First: /addchild <name> then /use <name>.\n\n" +
-        "Then pick what you need below:\n" +
-        "📖 Word Meaning — ask what a word means\n" +
-        "📝 Passage Meaning — ask what a passage means\n" +
-        "🧠 Quiz — test on a book you've been reading"
+      "📚 Reading Tracker botga xush kelibsiz!\n\nKim bilan ishlaymiz?",
+      childKeyboard
     );
   }
 
@@ -367,31 +418,24 @@ async function handleUpdate(update) {
     const child = rows[0];
     await updateSession(userId, { active_child_id: child.id, mode: "idle" });
 
-    const inProgress = await getInProgressBook(child.id);
-    if (inProgress) {
-      const nextEnd = (inProgress.last_page || 0) + RESUME_PAGE_INCREMENT;
-      await updateSession(userId, { mode: "resume_check", quiz_book_title: inProgress.title });
-      return sendText(
-        chatId,
-        `Welcome back, ${child.name}! You're at page ${inProgress.last_page} of "${inProgress.title}". Have you read up to page ${nextEnd} (the next ${RESUME_PAGE_INCREMENT} pages)?`,
-        resumeKeyboard
-      );
+    if (!(await checkResumeOrPrompt(chatId, userId, child))) {
+      return sendMenu(chatId, `✅ Active child set to "${name}".`);
     }
-    return sendMenu(chatId, `✅ Active child set to "${name}".`);
+    return;
   }
 
   const activeChild = await getActiveChild(session);
 
   if (text?.startsWith("/status")) {
     if (!activeChild) return sendText(chatId, "No active child. Use /use <name> first.");
-    const books = await query("SELECT title, last_page, last_page_range, status FROM books WHERE child_id=$1 ORDER BY updated_at DESC", [activeChild.id]);
+    const books = await query("SELECT title, last_page, last_page_range, total_pages, status FROM books WHERE child_id=$1 ORDER BY updated_at DESC", [activeChild.id]);
     const rows = await query(
       "SELECT book_title, score_percent, passed, date FROM chapter_records WHERE child_id=$1 ORDER BY date DESC LIMIT 10",
       [activeChild.id]
     );
     let out = `📚 Books for ${activeChild.name}:\n`;
     out += books.length
-      ? books.map((b) => `- ${b.title}${b.last_page ? ` (at page ${b.last_page})` : ""}`).join("\n")
+      ? books.map((b) => `${b.status === "finished" ? "✅" : "📖"} ${b.title}${b.last_page ? ` (at page ${b.last_page}${b.total_pages ? `/${b.total_pages}` : ""})` : ""}`).join("\n")
       : "None yet.";
     out += `\n\n📊 Recent quiz scores:\n`;
     out += rows.length
@@ -405,7 +449,7 @@ async function handleUpdate(update) {
     const rows = await query("SELECT * FROM children WHERE telegram_user_id=$1 AND name=$2", [userId, name]);
     const child = rows[0];
     if (!child) return sendText(chatId, "Usage: /report <child name>");
-    const books = await query("SELECT title, last_page FROM books WHERE child_id=$1 ORDER BY created_at", [child.id]);
+    const books = await query("SELECT title, last_page, total_pages, status FROM books WHERE child_id=$1 ORDER BY created_at", [child.id]);
     const records = await query(
       "SELECT book_title, score_percent, passed, date FROM chapter_records WHERE child_id=$1 ORDER BY date",
       [child.id]
@@ -416,7 +460,7 @@ async function handleUpdate(update) {
     );
     let out = `📋 Full report for ${child.name}:\n\n📚 Books read:\n`;
     out += books.length
-      ? books.map((b) => `- ${b.title}${b.last_page ? ` (at page ${b.last_page})` : ""}`).join("\n")
+      ? books.map((b) => `${b.status === "finished" ? "✅" : "📖"} ${b.title}${b.last_page ? ` (at page ${b.last_page}${b.total_pages ? `/${b.total_pages}` : ""})` : ""}`).join("\n")
       : "None yet.";
     out += "\n\n📖 Quiz history:\n";
     out += records.length
@@ -431,26 +475,22 @@ async function handleUpdate(update) {
 
   if (!activeChild) {
     if (text === MENU.WORD || text === MENU.PASSAGE || text === MENU.QUIZ) {
-      await updateSession(userId, { mode: "awaiting_child_name", pending_action: text });
-      return sendText(chatId, "Avval bolaning ismini kiriting:", { remove_keyboard: true });
+      await updateSession(userId, { mode: "awaiting_child_select", pending_action: text });
+      return sendText(chatId, "Kim bilan ishlaymiz?", childKeyboard);
     }
 
-    if (session.mode === "awaiting_child_name" && text) {
-      const name = text.trim();
-      if (!name) return sendText(chatId, "Iltimos, ism kiriting:");
-      await query(
-        `INSERT INTO children (telegram_user_id, name) VALUES ($1, $2)
-         ON CONFLICT (telegram_user_id, name) DO NOTHING`,
-        [userId, name]
-      );
-      const rows = await query("SELECT id FROM children WHERE telegram_user_id=$1 AND name=$2", [userId, name]);
-      const childId = rows[0].id;
+    if (session.mode === "awaiting_child_select" && text && CHILD_NAMES.includes(text)) {
+      await ensureChildren(userId);
+      const child = await getChildByName(userId, text);
       const pending = session.pending_action;
-      await updateSession(userId, { active_child_id: childId, pending_action: null });
+      await updateSession(userId, { active_child_id: child.id, pending_action: null, mode: "idle" });
 
       if (pending === MENU.QUIZ) {
-        await updateSession(userId, { mode: "quiz_choose_type" });
-        return sendText(chatId, "Is this a small booklet (whole book) or a big book (specific pages)?", bookTypeKeyboard);
+        if (!(await checkResumeOrPrompt(chatId, userId, child))) {
+          await updateSession(userId, { mode: "quiz_choose_type" });
+          await sendText(chatId, "Is this a small booklet (whole book) or a big book (specific pages)?", bookTypeKeyboard);
+        }
+        return;
       }
       if (pending === MENU.WORD) {
         await updateSession(userId, { mode: "awaiting_word" });
@@ -460,11 +500,11 @@ async function handleUpdate(update) {
         await updateSession(userId, { mode: "awaiting_passage" });
         return sendText(chatId, "Send the passage as text, or a photo of it:");
       }
-      await updateSession(userId, { mode: "idle" });
-      return sendMenu(chatId, `✅ "${name}" qo'shildi va faol qilib belgilandi.`);
+      return sendMenu(chatId, `✅ "${child.name}" tanlandi.`);
     }
 
-    return sendText(chatId, "Please set an active child first: /use <name> (or /addchild <name>), or tap a menu option below.", mainMenuKeyboard);
+    await ensureChildren(userId);
+    return sendText(chatId, "Iltimos, pastdagi tugmalardan birini tanlang:", childKeyboard);
   }
 
   // ---- Resume check ----
@@ -500,7 +540,7 @@ async function handleUpdate(update) {
 
   if (text === MENU.QUIZ) {
     await updateSession(userId, { mode: "quiz_awaiting_name" });
-    return sendText(chatId, `Who is taking this quiz? Type their name (e.g. "${activeChild.name}" or a different child):`, { remove_keyboard: true });
+    return sendText(chatId, "Kim quiz topshiradi?", childKeyboard);
   }
 
   // ---- State machine ----
@@ -534,29 +574,18 @@ async function handleUpdate(update) {
   }
 
   if (session.mode === "quiz_awaiting_name" && text) {
-    const name = text.trim();
-    if (!name) return sendText(chatId, "Please type a name:");
-    await query(
-      `INSERT INTO children (telegram_user_id, name) VALUES ($1, $2)
-       ON CONFLICT (telegram_user_id, name) DO NOTHING`,
-      [userId, name]
-    );
-    const rows = await query("SELECT * FROM children WHERE telegram_user_id=$1 AND name=$2", [userId, name]);
-    const quizChild = rows[0];
+    if (!CHILD_NAMES.includes(text)) {
+      return sendText(chatId, "Iltimos, pastdagi tugmalardan birini tanlang:", childKeyboard);
+    }
+    await ensureChildren(userId);
+    const quizChild = await getChildByName(userId, text);
     await updateSession(userId, { active_child_id: quizChild.id, mode: "idle" });
 
-    const inProgress = await getInProgressBook(quizChild.id);
-    if (inProgress) {
-      const nextEnd = (inProgress.last_page || 0) + RESUME_PAGE_INCREMENT;
-      await updateSession(userId, { mode: "resume_check", quiz_book_title: inProgress.title });
-      return sendText(
-        chatId,
-        `Welcome back, ${quizChild.name}! You're at page ${inProgress.last_page} of "${inProgress.title}". Have you read up to page ${nextEnd} (the next ${RESUME_PAGE_INCREMENT} pages)?`,
-        resumeKeyboard
-      );
+    if (!(await checkResumeOrPrompt(chatId, userId, quizChild))) {
+      await updateSession(userId, { mode: "quiz_choose_type" });
+      return sendText(chatId, "Is this a small booklet (whole book) or a big book (specific pages)?", bookTypeKeyboard);
     }
-    await updateSession(userId, { mode: "quiz_choose_type" });
-    return sendText(chatId, "Is this a small booklet (whole book) or a big book (specific pages)?", bookTypeKeyboard);
+    return;
   }
 
   if (session.mode === "quiz_choose_type") {
@@ -581,13 +610,37 @@ async function handleUpdate(update) {
     const finalTitle = searchResult.title || info.title;
     const finalAuthor = searchResult.author || info.author || "";
     await updateSession(userId, {
-      mode: "quiz_awaiting_pages",
       quiz_book_title: finalTitle,
       quiz_author: finalAuthor,
       quiz_found: searchResult.found === true,
     });
-    const hint = session.quiz_book_type === "big" ? ` (please read at least ${MIN_PAGES_BIG_BOOK} pages, e.g. "10-20")` : "";
-    return sendText(chatId, `"${finalTitle}" — which pages have you read?${hint}`);
+
+    if (searchResult.found) {
+      await updateSession(userId, { mode: "quiz_awaiting_pages" });
+      const hint = session.quiz_book_type === "big" ? ` (please read at least ${MIN_PAGES_BIG_BOOK} pages, e.g. "10-20")` : "";
+      return sendText(chatId, `"${finalTitle}" — which pages have you read?${hint}`);
+    } else {
+      await updateSession(userId, { mode: "quiz_awaiting_total_pages" });
+      return sendText(chatId, `"${finalTitle}" kitobini internetdan topa olmadim. Bu kitob jami nechta betdan iborat?`);
+    }
+  }
+
+  if (session.mode === "quiz_awaiting_total_pages" && text) {
+    const totalPages = parseInt(text.replace(/\D/g, ""), 10);
+    if (!totalPages || totalPages <= 0) {
+      return sendText(chatId, "Iltimos, kitobning jami bet sonini raqamda kiriting (masalan: 120).");
+    }
+    await upsertBookProgress(activeChild.id, session.quiz_book_title, {
+      author: session.quiz_author,
+      foundOnline: false,
+      bookType: session.quiz_book_type,
+      totalPages,
+    });
+    await updateSession(userId, { mode: "quiz_collecting_photos", quiz_photos_json: "[]" });
+    return sendText(
+      chatId,
+      `Rahmat! Endi o'qigan sahifalaringizni birma-bir rasmga tushirib yuboring (kamida ${MIN_PAGES_BIG_BOOK} ta bet). Tugatgach "done" deb yozing.`
+    );
   }
 
   if (session.mode === "quiz_awaiting_pages" && text) {
@@ -615,36 +668,27 @@ async function handleUpdate(update) {
 
     await upsertBookProgress(activeChild.id, session.quiz_book_title, {
       author: session.quiz_author,
-      foundOnline: session.quiz_found,
+      foundOnline: true,
       bookType: session.quiz_book_type,
       pageRangeText: pageRange,
       lastPage,
     });
 
-    if (session.quiz_found) {
-      await sendText(chatId, "Generating your quiz, one moment...");
-      const previousQuestions = await getPreviousQuestions(activeChild.id, session.quiz_book_title);
-      const questions = await generateQuizFromKnowledge(session.quiz_book_title, session.quiz_author, pageRange, previousQuestions);
-      if (!questions || !questions.length) {
-        await updateSession(userId, { mode: "idle" });
-        return sendMenu(chatId, "Sorry, I couldn't generate a quiz for that book. Please try 🧠 Quiz again.");
-      }
-      await updateSession(userId, {
-        mode: "quiz",
-        quiz_page_range: pageRange,
-        quiz_questions_json: JSON.stringify(questions),
-        quiz_current_index: 0,
-        quiz_correct_count: 0,
-      });
-      return askQuizQuestion(chatId, questions, 0);
-    } else {
-      await updateSession(userId, { mode: "quiz_collecting_photos", quiz_page_range: pageRange, quiz_photos_json: "[]" });
-      const instructions =
-        session.quiz_book_type === "small"
-          ? "I couldn't find this book online. Please send photos of all the pages you've read. Type 'done' when finished."
-          : `I couldn't find this book online. Please send photos of the pages you've read${pageRange ? ` (${pageRange})` : ""}. Type 'done' when finished.`;
-      return sendText(chatId, instructions);
+    await sendText(chatId, "Generating your quiz, one moment...");
+    const previousQuestions = await getPreviousQuestions(activeChild.id, session.quiz_book_title);
+    const questions = await generateQuizFromKnowledge(session.quiz_book_title, session.quiz_author, pageRange, previousQuestions);
+    if (!questions || !questions.length) {
+      await updateSession(userId, { mode: "idle" });
+      return sendMenu(chatId, "Sorry, I couldn't generate a quiz for that book. Please try 🧠 Quiz again.");
     }
+    await updateSession(userId, {
+      mode: "quiz",
+      quiz_page_range: pageRange,
+      quiz_questions_json: JSON.stringify(questions),
+      quiz_current_index: 0,
+      quiz_correct_count: 0,
+    });
+    return askQuizQuestion(chatId, questions, 0);
   }
 
   if (session.mode === "quiz_collecting_photos") {
@@ -662,9 +706,20 @@ async function handleUpdate(update) {
     }
     if (text && text.toLowerCase() === "done") {
       const photos = JSON.parse(session.quiz_photos_json || "[]");
-      if (!photos.length) {
-        return sendText(chatId, "Please send at least one page photo first, then type 'done'.");
+      if (photos.length < MIN_PAGES_BIG_BOOK) {
+        return sendText(
+          chatId,
+          `Kamida ${MIN_PAGES_BIG_BOOK} ta bet fotosurati kerak (hozircha ${photos.length} ta yubordingiz). Yana rasm yuboring.`
+        );
       }
+
+      const books = await query("SELECT * FROM books WHERE child_id=$1 AND title=$2", [activeChild.id, session.quiz_book_title]);
+      const book = books[0];
+      const startPage = (book?.last_page || 0) + 1;
+      const endPage = (book?.last_page || 0) + photos.length;
+      const pageRangeText = `${startPage}-${endPage}`;
+      await upsertBookProgress(activeChild.id, session.quiz_book_title, { lastPage: endPage, pageRangeText });
+
       await sendText(chatId, "Generating your quiz from those pages, one moment...");
       const previousQuestions = await getPreviousQuestions(activeChild.id, session.quiz_book_title);
       const questions = await generateQuizFromPagePhotos(photos, session.quiz_book_title, previousQuestions);
@@ -674,6 +729,7 @@ async function handleUpdate(update) {
       }
       await updateSession(userId, {
         mode: "quiz",
+        quiz_page_range: pageRangeText,
         quiz_questions_json: JSON.stringify(questions),
         quiz_current_index: 0,
         quiz_correct_count: 0,
@@ -681,7 +737,7 @@ async function handleUpdate(update) {
       });
       return askQuizQuestion(chatId, questions, 0);
     }
-    return sendText(chatId, "Send a page photo, or type 'done' when finished.");
+    return sendText(chatId, `Send a page photo, or type 'done' when finished (kamida ${MIN_PAGES_BIG_BOOK} ta bet kerak).`);
   }
 
   if (session.mode === "quiz" && text) {
@@ -706,17 +762,35 @@ async function handleUpdate(update) {
         "INSERT INTO chapter_records (child_id, book_title, chapter_number, score_percent, passed, attempt_number, questions_json) VALUES ($1,$2,$3,$4,$5,$6,$7)",
         [activeChild.id, session.quiz_book_title, 0, scorePercent, passed, Number(attemptRows[0].c) + 1, JSON.stringify(questions)]
       );
-      await updateSession(userId, { mode: "idle", quiz_questions_json: null, quiz_current_index: 0, quiz_correct_count: 0 });
       const scopeLabel = session.quiz_page_range ? `pages ${session.quiz_page_range}` : "the book";
-      if (passed) {
-        return sendMenu(chatId, `🎉 ${activeChild.name} scored ${scorePercent}%! ✅ Passed "${session.quiz_book_title}" (${scopeLabel}).`);
-      } else {
-        return sendMenu(chatId, `Score: ${scorePercent}%. ❌ Not quite — please re-read "${session.quiz_book_title}" (${scopeLabel}) and try 🧠 Quiz again. (Next attempt will have different questions.)`);
-      }
+      const resultMessage = passed
+        ? `🎉 ${activeChild.name} scored ${scorePercent}%! ✅ Passed "${session.quiz_book_title}" (${scopeLabel}).`
+        : `Score: ${scorePercent}%. ❌ Not quite — please re-read "${session.quiz_book_title}" (${scopeLabel}) and try 🧠 Quiz again. (Next attempt will have different questions.)`;
+      await updateSession(userId, {
+        mode: "book_finished_check",
+        quiz_questions_json: null,
+        quiz_current_index: 0,
+        quiz_correct_count: 0,
+        pending_message: resultMessage,
+      });
+      return sendText(chatId, `${resultMessage}\n\n"${session.quiz_book_title}" kitobini butunlay tugatdingizmi?`, finishedKeyboard);
     } else {
       await updateSession(userId, { quiz_current_index: nextIdx, quiz_correct_count: newCorrectCount });
       return askQuizQuestion(chatId, questions, nextIdx);
     }
+  }
+
+  if (session.mode === "book_finished_check") {
+    if (text === FINISHED.YES || text === FINISHED.NO) {
+      await query(
+        "UPDATE books SET status=$1, updated_at=NOW() WHERE child_id=$2 AND title=$3",
+        [text === FINISHED.YES ? "finished" : "in_progress", activeChild.id, session.quiz_book_title]
+      );
+      await updateSession(userId, { mode: "idle", pending_message: null });
+      const confirmLine = text === FINISHED.YES ? `🏁 "${session.quiz_book_title}" tugatilgan deb belgilandi. Ajoyib!` : "Yaxshi, davom eting! 📖";
+      return sendMenu(chatId, confirmLine);
+    }
+    return sendText(chatId, "Iltimos, pastdagi tugmalardan birini tanlang:", finishedKeyboard);
   }
 
   if (session.mode === "idle") {
