@@ -36,8 +36,8 @@ const RESUME = {
   NOT_YET: "📖 Not yet",
 };
 const FINISHED = {
-  YES: "✅ Ha, tugatdim",
-  NO: "📖 Yo'q, davom etyapman",
+  YES: "✅ Yes, I finished it",
+  NO: "📖 No, still reading",
 };
 
 // Fixed set of children — pre-registered on /start, selected via buttons.
@@ -398,7 +398,7 @@ async function startQuizFromKnownBook(chatId, userId, activeChild, book) {
       await updateSession(userId, { mode: "quiz_collecting_photos", quiz_book_title: book.title, quiz_photos_json: "[]" });
       return sendText(
         chatId,
-        `Bu kitobning aniq mazmunini yetarlicha bilmayman, shuning uchun taxminiy savol bermayman. Iltimos, keyingi o'qigan sahifalaringizni rasmga tushirib yuboring (kamida ${MIN_PAGES_BIG_BOOK} ta bet). Tugatgach "done" deb yozing.`
+        `I don't know this book's specific content well enough, so I won't guess. Please send photos of the next pages you've read (at least ${MIN_PAGES_BIG_BOOK} pages). Type "done" when finished.`
       );
     }
     if (!questions || !questions.length) {
@@ -423,7 +423,7 @@ async function startQuizFromKnownBook(chatId, userId, activeChild, book) {
     });
     return sendText(
       chatId,
-      `Iltimos, keyingi o'qigan sahifalaringizni birma-bir rasmga tushirib yuboring (kamida ${MIN_PAGES_BIG_BOOK} ta bet). Tugatgach "done" deb yozing.`
+      `Please send photos of the next pages you've read, one by one (at least ${MIN_PAGES_BIG_BOOK} pages). Type "done" when finished.`
     );
   }
 }
@@ -442,7 +442,7 @@ async function handleUpdate(update) {
     await updateSession(userId, { mode: "awaiting_child_select", pending_action: null });
     return sendText(
       chatId,
-      "📚 Reading Tracker botga xush kelibsiz!\n\nKim bilan ishlaymiz?",
+      "📚 Welcome to the Reading Tracker Bot!\n\nWho are we working with?",
       childKeyboard
     );
   }
@@ -531,7 +531,7 @@ async function handleUpdate(update) {
   if (!activeChild) {
     if (text === MENU.WORD || text === MENU.PASSAGE || text === MENU.QUIZ) {
       await updateSession(userId, { mode: "awaiting_child_select", pending_action: text });
-      return sendText(chatId, "Kim bilan ishlaymiz?", childKeyboard);
+      return sendText(chatId, "Who are we working with?", childKeyboard);
     }
 
     if (session.mode === "awaiting_child_select" && text && CHILD_NAMES.includes(text)) {
@@ -555,11 +555,11 @@ async function handleUpdate(update) {
         await updateSession(userId, { mode: "awaiting_passage" });
         return sendText(chatId, "Send the passage as text, or a photo of it:");
       }
-      return sendMenu(chatId, `✅ "${child.name}" tanlandi.`);
+      return sendMenu(chatId, `✅ "${child.name}" selected.`);
     }
 
     await ensureChildren(userId);
-    return sendText(chatId, "Iltimos, pastdagi tugmalardan birini tanlang:", childKeyboard);
+    return sendText(chatId, "Please choose one of the buttons below:", childKeyboard);
   }
 
   // ---- Resume check ----
@@ -595,7 +595,7 @@ async function handleUpdate(update) {
 
   if (text === MENU.QUIZ) {
     await updateSession(userId, { mode: "quiz_awaiting_name" });
-    return sendText(chatId, "Kim quiz topshiradi?", childKeyboard);
+    return sendText(chatId, "Who's taking the quiz?", childKeyboard);
   }
 
   // ---- State machine ----
@@ -642,7 +642,7 @@ async function handleUpdate(update) {
 
   if (session.mode === "quiz_awaiting_name" && text) {
     if (!CHILD_NAMES.includes(text)) {
-      return sendText(chatId, "Iltimos, pastdagi tugmalardan birini tanlang:", childKeyboard);
+      return sendText(chatId, "Please choose one of the buttons below:", childKeyboard);
     }
     await ensureChildren(userId);
     const quizChild = await getChildByName(userId, text);
@@ -706,14 +706,14 @@ async function handleUpdate(update) {
       return sendText(chatId, `"${finalTitle}" — which pages have you read?${hint}`);
     } else {
       await updateSession(userId, { mode: "quiz_awaiting_total_pages" });
-      return sendText(chatId, `"${finalTitle}" kitobini internetdan topa olmadim. Bu kitob jami nechta betdan iborat?`);
+      return sendText(chatId, `I couldn't find "${finalTitle}" online. How many pages does this book have in total?`);
     }
   }
 
   if (session.mode === "quiz_awaiting_total_pages" && text) {
     const totalPages = parseInt(text.replace(/\D/g, ""), 10);
     if (!totalPages || totalPages <= 0) {
-      return sendText(chatId, "Iltimos, kitobning jami bet sonini raqamda kiriting (masalan: 120).");
+      return sendText(chatId, "Please enter the total number of pages as a number (e.g. 120).");
     }
     await upsertBookProgress(activeChild.id, session.quiz_book_title, {
       author: session.quiz_author,
@@ -724,7 +724,7 @@ async function handleUpdate(update) {
     await updateSession(userId, { mode: "quiz_collecting_photos", quiz_photos_json: "[]" });
     return sendText(
       chatId,
-      `Rahmat! Endi o'qigan sahifalaringizni birma-bir rasmga tushirib yuboring (kamida ${MIN_PAGES_BIG_BOOK} ta bet). Tugatgach "done" deb yozing.`
+      `Thanks! Now send photos of the pages you've read, one by one (at least ${MIN_PAGES_BIG_BOOK} pages). Type "done" when finished.`
     );
   }
 
@@ -768,7 +768,7 @@ async function handleUpdate(update) {
       await updateSession(userId, { mode: "quiz_awaiting_total_pages" });
       return sendText(
         chatId,
-        `Bu kitobning aniq mazmunini yetarlicha bilmayman, shuning uchun taxminiy savol bermayman. "${session.quiz_book_title}" kitobi jami nechta betdan iborat?`
+        `I don't know this book's specific content well enough, so I won't guess. How many pages does "${session.quiz_book_title}" have in total?`
       );
     }
     if (!questions || !questions.length) {
@@ -803,7 +803,7 @@ async function handleUpdate(update) {
       if (photos.length < MIN_PAGES_BIG_BOOK) {
         return sendText(
           chatId,
-          `Kamida ${MIN_PAGES_BIG_BOOK} ta bet fotosurati kerak (hozircha ${photos.length} ta yubordingiz). Yana rasm yuboring.`
+          `At least ${MIN_PAGES_BIG_BOOK} page photos are needed (you've sent ${photos.length} so far). Please send more.`
         );
       }
 
@@ -831,7 +831,7 @@ async function handleUpdate(update) {
       });
       return askQuizQuestion(chatId, questions, 0);
     }
-    return sendText(chatId, `Send a page photo, or type 'done' when finished (kamida ${MIN_PAGES_BIG_BOOK} ta bet kerak).`);
+    return sendText(chatId, `Send a page photo, or type 'done' when finished (at least ${MIN_PAGES_BIG_BOOK} pages needed).`);
   }
 
   if (session.mode === "quiz" && text) {
@@ -867,7 +867,7 @@ async function handleUpdate(update) {
         quiz_correct_count: 0,
         pending_message: resultMessage,
       });
-      return sendText(chatId, `${resultMessage}\n\n"${session.quiz_book_title}" kitobini butunlay tugatdingizmi?`, finishedKeyboard);
+      return sendText(chatId, `${resultMessage}\n\nDid you finish "${session.quiz_book_title}" completely?`, finishedKeyboard);
     } else {
       await updateSession(userId, { quiz_current_index: nextIdx, quiz_correct_count: newCorrectCount });
       return askQuizQuestion(chatId, questions, nextIdx);
@@ -881,10 +881,10 @@ async function handleUpdate(update) {
         [text === FINISHED.YES ? "finished" : "in_progress", activeChild.id, session.quiz_book_title]
       );
       await updateSession(userId, { mode: "idle", pending_message: null });
-      const confirmLine = text === FINISHED.YES ? `🏁 "${session.quiz_book_title}" tugatilgan deb belgilandi. Ajoyib!` : "Yaxshi, davom eting! 📖";
+      const confirmLine = text === FINISHED.YES ? `🏁 "${session.quiz_book_title}" marked as finished. Great job!` : "Great, keep going! 📖";
       return sendMenu(chatId, confirmLine);
     }
-    return sendText(chatId, "Iltimos, pastdagi tugmalardan birini tanlang:", finishedKeyboard);
+    return sendText(chatId, "Please choose one of the buttons below:", finishedKeyboard);
   }
 
   if (session.mode === "idle") {
