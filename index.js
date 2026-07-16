@@ -168,7 +168,15 @@ async function extractBookInfo(base64Image, mediaType) {
 }
 
 async function searchBookOnline(title, author) {
-  const prompt = `Search the web to check whether a real, identifiable, published book titled "${title}"${author ? ` by ${author}` : ""} exists. After searching, respond ONLY with valid JSON, no markdown fences, no preamble, in this exact format: {"found": true, "title": "confirmed title", "author": "confirmed author or empty string"} — set "found" to false if you cannot confidently identify this specific book.`;
+  const prompt = `Search the web for a real, identifiable, published book titled "${title}"${author ? ` by ${author}` : ""}.
+
+This check has a strict purpose: I need to generate quiz questions about SPECIFIC content (facts, events, details) from particular pages of this book. Only say "found: true" if BOTH of these are true:
+1. You can confirm via search that this specific book genuinely exists (not just a similar-sounding topic).
+2. You are confident you know enough of its actual specific content — not just the general subject area — to write accurate, non-generic quiz questions about particular pages of it, without guessing or inventing plausible-sounding facts.
+
+Many real books (especially children's non-fiction, workbooks, textbooks, self-published, or regional titles) exist but have little to no content indexed online — for these, you should say "found: false" even though the book itself is real, because you cannot reliably quiz on their specific content. When in doubt, prefer "found: false" — a false negative just means the child sends photos instead, which is safe; a false positive means the quiz could contain made-up facts, which is worse.
+
+Respond ONLY with valid JSON, no markdown fences, no preamble: {"found": true, "title": "confirmed title", "author": "confirmed author or empty string"}`;
   const raw = await callClaude([{ role: "user", content: prompt }], 1500, [{ type: "web_search_20250305", name: "web_search" }]);
   if (!raw) return { found: false, title, author };
   const clean = raw.replace(/```json|```/g, "").trim();
@@ -204,9 +212,11 @@ async function generateQuizFromKnowledge(title, author, pageRange, previousQuest
     : `They did not specify exact pages, so cover general content from the book.`;
   const prompt = `You are a reading comprehension teacher. A child has been reading the book "${title}"${author ? ` by ${author}` : ""}. ${scopeText}
 
-Using your knowledge of this book, write exactly ${QUESTIONS_PER_QUIZ} multiple-choice reading comprehension questions covering that portion of the book. Do not invent specific plot details you are not confident about.${avoidanceClause(previousQuestions)}
+Using your knowledge of this book, write exactly ${QUESTIONS_PER_QUIZ} multiple-choice reading comprehension questions covering that portion of the book. Every question and its correct answer must be based on content you actually, specifically know from this book — never invent, guess, or generalize plausible-sounding plot details, facts, or figures.
 
-Return ONLY valid JSON, no markdown fences, no preamble, in this exact format:
+If, being honest, you do not have specific enough knowledge of this book's actual content (this is common for children's non-fiction, workbooks, textbooks, or lesser-known titles even when the book itself is real) — do NOT invent a quiz. Instead respond with exactly: {"insufficient_knowledge": true}${avoidanceClause(previousQuestions)}
+
+Otherwise, return ONLY valid JSON, no markdown fences, no preamble, in this exact format:
 [
   {"question": "...", "options": {"A": "...", "B": "...", "C": "...", "D": "..."}, "correct": "A"},
   ...
@@ -214,7 +224,11 @@ Return ONLY valid JSON, no markdown fences, no preamble, in this exact format:
   const raw = await callClaude([{ role: "user", content: prompt }], 2000);
   if (!raw) return null;
   const clean = raw.replace(/```json|```/g, "").trim();
-  try { return JSON.parse(clean); } catch (e) {
+  try {
+    const parsed = JSON.parse(clean);
+    if (parsed && parsed.insufficient_knowledge) return "INSUFFICIENT_KNOWLEDGE";
+    return parsed;
+  } catch (e) {
     console.error("Failed to parse quiz JSON:", clean);
     return null;
   }
@@ -377,6 +391,16 @@ async function startQuizFromKnownBook(chatId, userId, activeChild, book) {
     const nextEnd = (book.last_page || 0) + RESUME_PAGE_INCREMENT;
     const pageRange = `${(book.last_page || 0) + 1}-${nextEnd}`;
     const questions = await generateQuizFromKnowledge(book.title, book.author, pageRange, previousQuestions);
+
+    if (questions === "INSUFFICIENT_KNOWLEDGE") {
+      // Downgrade permanently — future sessions for this book skip straight to photos.
+      await query("UPDATE books SET found_online=false WHERE id=$1", [book.id]);
+      await updateSession(userId, { mode: "quiz_collecting_photos", quiz_book_title: book.title, quiz_photos_json: "[]" });
+      return sendText(
+        chatId,
+        `Bu kitobning aniq mazmunini yetarlicha bilmayman, shuning uchun taxminiy savol bermayman. Iltimos, keyingi o'qigan sahifalaringizni rasmga tushirib yuboring (kamida ${MIN_PAGES_BIG_BOOK} ta bet). Tugatgach "done" deb yozing.`
+      );
+    }
     if (!questions || !questions.length) {
       await updateSession(userId, { mode: "idle" });
       return sendMenu(chatId, "Sorry, I couldn't generate a quiz right now. Please try 🧠 Quiz again.");
@@ -738,6 +762,15 @@ async function handleUpdate(update) {
     await sendText(chatId, "Generating your quiz, one moment...");
     const previousQuestions = await getPreviousQuestions(activeChild.id, session.quiz_book_title);
     const questions = await generateQuizFromKnowledge(session.quiz_book_title, session.quiz_author, pageRange, previousQuestions);
+
+    if (questions === "INSUFFICIENT_KNOWLEDGE") {
+      await query("UPDATE books SET found_online=false WHERE child_id=$1 AND title=$2", [activeChild.id, session.quiz_book_title]);
+      await updateSession(userId, { mode: "quiz_awaiting_total_pages" });
+      return sendText(
+        chatId,
+        `Bu kitobning aniq mazmunini yetarlicha bilmayman, shuning uchun taxminiy savol bermayman. "${session.quiz_book_title}" kitobi jami nechta betdan iborat?`
+      );
+    }
     if (!questions || !questions.length) {
       await updateSession(userId, { mode: "idle" });
       return sendMenu(chatId, "Sorry, I couldn't generate a quiz for that book. Please try 🧠 Quiz again.");
