@@ -1,3 +1,4 @@
+import "dotenv/config";
 import express from "express";
 import { query, pool } from "./db.js";
 
@@ -6,9 +7,18 @@ app.use(express.json());
 
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+
+for (const [name, val] of [
+  ["TELEGRAM_BOT_TOKEN", TELEGRAM_BOT_TOKEN],
+  ["ANTHROPIC_API_KEY", ANTHROPIC_API_KEY],
+  ["DATABASE_URL", process.env.DATABASE_URL],
+]) {
+  console.log(val ? `✅ ${name} is set` : `❌ ${name} is MISSING — check your .env file or environment variables`);
+}
+
 const PASS_THRESHOLD = 80;
 const QUESTIONS_PER_QUIZ = 8;
-const CLAUDE_MODEL = "claude-sonnet-4-6";
+const CLAUDE_MODEL = process.env.CLAUDE_MODEL || "claude-sonnet-5";
 const MIN_PAGES_BIG_BOOK = 5;
 const RESUME_PAGE_INCREMENT = 10;
 
