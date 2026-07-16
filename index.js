@@ -74,7 +74,7 @@ async function getTelegramFileBase64(fileId) {
 
 // ---------- Claude API helpers ----------
 
-async function callClaude(messages, maxTokens = 1024, tools = null) {
+async function callClaude(messages, maxTokens = 1024, tools = null, attempt = 1) {
   const body = { model: CLAUDE_MODEL, max_tokens: maxTokens, messages };
   if (tools) body.tools = tools;
   const res = await fetch("https://api.anthropic.com/v1/messages", {
@@ -90,8 +90,19 @@ async function callClaude(messages, maxTokens = 1024, tools = null) {
   if (data.content) {
     return data.content.map((b) => b.text || "").join("\n").trim();
   }
-  console.error("Claude API error:", JSON.stringify(data));
-  return "Sorry, I couldn't process that right now.";
+
+  const errorType = data.error?.type || "unknown_error";
+  const errorMessage = data.error?.message || JSON.stringify(data);
+  console.error(`Claude API error (attempt ${attempt}, status ${res.status}): [${errorType}] ${errorMessage}`);
+
+  // Retry once on transient errors (overload / rate limit / server-side 5xx).
+  const retriable = ["overloaded_error", "rate_limit_error", "api_error"].includes(errorType) || res.status >= 500;
+  if (retriable && attempt < 3) {
+    await new Promise((r) => setTimeout(r, 1500 * attempt));
+    return callClaude(messages, maxTokens, tools, attempt + 1);
+  }
+
+  return null;
 }
 
 async function explainText(text, isPassage) {
@@ -119,6 +130,7 @@ async function checkImageReadable(base64Image, mediaType, context) {
       { type: "text", text: prompt },
     ]},
   ], 300);
+  if (!raw) return { readable: true, reason: "" }; // fail open — don't block a real photo on an API hiccup
   const clean = raw.replace(/```json|```/g, "").trim();
   try {
     const parsed = JSON.parse(clean);
@@ -137,6 +149,7 @@ async function extractBookInfo(base64Image, mediaType) {
       { type: "text", text: prompt },
     ]},
   ]);
+  if (!raw) return { title: "Unknown book", author: "" };
   const clean = raw.replace(/```json|```/g, "").trim();
   try { return JSON.parse(clean); } catch (e) {
     console.error("Failed to parse book info JSON:", clean);
@@ -147,6 +160,7 @@ async function extractBookInfo(base64Image, mediaType) {
 async function searchBookOnline(title, author) {
   const prompt = `Search the web to check whether a real, identifiable, published book titled "${title}"${author ? ` by ${author}` : ""} exists. After searching, respond ONLY with valid JSON, no markdown fences, no preamble, in this exact format: {"found": true, "title": "confirmed title", "author": "confirmed author or empty string"} — set "found" to false if you cannot confidently identify this specific book.`;
   const raw = await callClaude([{ role: "user", content: prompt }], 1500, [{ type: "web_search_20250305", name: "web_search" }]);
+  if (!raw) return { found: false, title, author };
   const clean = raw.replace(/```json|```/g, "").trim();
   try {
     const jsonMatch = clean.match(/\{[\s\S]*\}/);
@@ -188,6 +202,7 @@ Return ONLY valid JSON, no markdown fences, no preamble, in this exact format:
   ...
 ]`;
   const raw = await callClaude([{ role: "user", content: prompt }], 2000);
+  if (!raw) return null;
   const clean = raw.replace(/```json|```/g, "").trim();
   try { return JSON.parse(clean); } catch (e) {
     console.error("Failed to parse quiz JSON:", clean);
@@ -211,6 +226,7 @@ Return ONLY valid JSON, no markdown fences, no preamble, in this exact format:
 ]`,
   });
   const raw = await callClaude([{ role: "user", content }], 3000);
+  if (!raw) return null;
   const clean = raw.replace(/```json|```/g, "").trim();
   try { return JSON.parse(clean); } catch (e) {
     console.error("Failed to parse quiz-from-photos JSON:", clean);
@@ -552,6 +568,10 @@ async function handleUpdate(update) {
 
   if (session.mode === "awaiting_word" && text) {
     const explanation = await explainText(text, false);
+    if (!explanation) {
+      await updateSession(userId, { mode: "idle" });
+      return sendMenu(chatId, "Sorry, I couldn't look that up right now — please try again in a moment.");
+    }
     await query("INSERT INTO explain_log (child_id, content_type, query_text, response_text) VALUES ($1,'text',$2,$3)", [activeChild.id, text, explanation]);
     await updateSession(userId, { mode: "idle" });
     return sendMenu(chatId, explanation);
@@ -566,12 +586,20 @@ async function handleUpdate(update) {
         return sendText(chatId, `📷 That photo isn't clear enough to read${quality.reason ? ` (${quality.reason})` : ""}. Please retake it and send again.`);
       }
       const explanation = await explainImage(base64, "image/jpeg", true);
+      if (!explanation) {
+        await updateSession(userId, { mode: "idle" });
+        return sendMenu(chatId, "Sorry, I couldn't process that right now — please try again in a moment.");
+      }
       await query("INSERT INTO explain_log (child_id, content_type, query_text, response_text) VALUES ($1,'image','[photo passage]',$2)", [activeChild.id, explanation]);
       await updateSession(userId, { mode: "idle" });
       return sendMenu(chatId, explanation);
     }
     if (text) {
       const explanation = await explainText(text, true);
+      if (!explanation) {
+        await updateSession(userId, { mode: "idle" });
+        return sendMenu(chatId, "Sorry, I couldn't process that right now — please try again in a moment.");
+      }
       await query("INSERT INTO explain_log (child_id, content_type, query_text, response_text) VALUES ($1,'text',$2,$3)", [activeChild.id, text, explanation]);
       await updateSession(userId, { mode: "idle" });
       return sendMenu(chatId, explanation);
@@ -610,17 +638,35 @@ async function handleUpdate(update) {
       return sendText(chatId, `📷 That photo isn't clear enough to read${quality.reason ? ` (${quality.reason})` : ""}. Please retake it in good light and send again.`);
     }
     const info = await extractBookInfo(base64, "image/jpeg");
-    await sendText(chatId, `Looking up "${info.title}"...`);
-    const searchResult = await searchBookOnline(info.title, info.author);
-    const finalTitle = searchResult.title || info.title;
-    const finalAuthor = searchResult.author || info.author || "";
+
+    // Reuse a prior found/not-found decision for this child+book if we've seen it before,
+    // instead of re-searching every time (search results can vary between calls).
+    const existing = await query(
+      "SELECT * FROM books WHERE child_id=$1 AND title ILIKE $2 LIMIT 1",
+      [activeChild.id, info.title]
+    );
+
+    let finalTitle, finalAuthor, found;
+    if (existing[0]) {
+      finalTitle = existing[0].title;
+      finalAuthor = existing[0].author || "";
+      found = existing[0].found_online === true;
+      await sendText(chatId, `Found this book in ${activeChild.name}'s history already — using saved info for "${finalTitle}".`);
+    } else {
+      await sendText(chatId, `Looking up "${info.title}"...`);
+      const searchResult = await searchBookOnline(info.title, info.author);
+      finalTitle = searchResult.title || info.title;
+      finalAuthor = searchResult.author || info.author || "";
+      found = searchResult.found === true;
+    }
+
     await updateSession(userId, {
       quiz_book_title: finalTitle,
       quiz_author: finalAuthor,
-      quiz_found: searchResult.found === true,
+      quiz_found: found,
     });
 
-    if (searchResult.found) {
+    if (found) {
       await updateSession(userId, { mode: "quiz_awaiting_pages" });
       const hint = session.quiz_book_type === "big" ? ` (please read at least ${MIN_PAGES_BIG_BOOK} pages, e.g. "10-20")` : "";
       return sendText(chatId, `"${finalTitle}" — which pages have you read?${hint}`);
