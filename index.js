@@ -34,6 +34,7 @@ const BOOK_TYPE = {
 const RESUME = {
   YES: "✅ Yes, quiz me",
   NOT_YET: "📖 Not yet",
+  FINISHED: "🏁 I finished this book",
 };
 const FINISHED = {
   YES: "✅ Yes, I finished it",
@@ -45,7 +46,7 @@ const CHILD_NAMES = ["Hanifa", "Ismail"];
 
 const mainMenuKeyboard = { keyboard: [[MENU.WORD, MENU.PASSAGE], [MENU.QUIZ]], resize_keyboard: true };
 const bookTypeKeyboard = { keyboard: [[BOOK_TYPE.SMALL], [BOOK_TYPE.BIG]], resize_keyboard: true, one_time_keyboard: true };
-const resumeKeyboard = { keyboard: [[RESUME.YES], [RESUME.NOT_YET]], resize_keyboard: true, one_time_keyboard: true };
+const resumeKeyboard = { keyboard: [[RESUME.YES], [RESUME.NOT_YET], [RESUME.FINISHED]], resize_keyboard: true, one_time_keyboard: true };
 const childKeyboard = { keyboard: [CHILD_NAMES], resize_keyboard: true, one_time_keyboard: true };
 const finishedKeyboard = { keyboard: [[FINISHED.YES], [FINISHED.NO]], resize_keyboard: true, one_time_keyboard: true };
 
@@ -324,7 +325,7 @@ async function checkResumeOrPrompt(chatId, userId, child) {
     await updateSession(userId, { mode: "resume_check", quiz_book_title: inProgress.title });
     await sendText(
       chatId,
-      `Welcome back, ${child.name}! You're at page ${inProgress.last_page} of "${inProgress.title}". Have you read up to page ${nextEnd} (the next ${RESUME_PAGE_INCREMENT} pages)?`,
+      `Welcome back, ${child.name}! You're at page ${inProgress.last_page} of "${inProgress.title}". Have you read up to page ${nextEnd} (the next ${RESUME_PAGE_INCREMENT} pages)? If you've finished the whole book already, tap "I finished this book" below.`,
       resumeKeyboard
     );
     return true;
@@ -577,6 +578,11 @@ async function handleUpdate(update) {
     if (text === RESUME.NOT_YET) {
       await updateSession(userId, { mode: "idle" });
       return sendMenu(chatId, "No problem — keep reading! Come back when you're ready. 📖");
+    }
+    if (text === RESUME.FINISHED) {
+      await query("UPDATE books SET status='finished', updated_at=NOW() WHERE child_id=$1 AND title=$2", [activeChild.id, session.quiz_book_title]);
+      await updateSession(userId, { mode: "idle" });
+      return sendMenu(chatId, `🏁 "${session.quiz_book_title}" marked as finished. Great job, ${activeChild.name}! 🎉`);
     }
     return sendText(chatId, "Please tap one of the options above.", resumeKeyboard);
   }
