@@ -207,7 +207,17 @@ function avoidanceClause(previousQuestions) {
   return `\n\nIMPORTANT: The child failed a previous attempt. Write a COMPLETELY DIFFERENT set of questions than these previously-asked ones (different angles, different details, do not just reword them):\n${list}`;
 }
 
-async function generateQuizFromKnowledge(title, author, pageRange, previousQuestions) {
+function difficultyClause(difficulty) {
+  if (difficulty === "easy") {
+    return `\n\nIMPORTANT — difficulty level: EASY (young/beginner reader). Use very simple, short sentences for both questions and answer options. Ask only about clear, literal, directly-stated facts (who, what, where, simple sequence of events) — avoid inference, "why," theme, or "what does this suggest" style questions. Keep vocabulary simple and age-appropriate. Make the correct answer clearly distinguishable from the wrong options rather than subtly different.`;
+  }
+  if (difficulty === "hard") {
+    return `\n\nIMPORTANT — difficulty level: HARD (advanced reader). Include some questions that require inference, connecting ideas across the passage, or understanding theme/motivation, not just literal recall.`;
+  }
+  return ""; // medium = default balanced difficulty, no special instruction
+}
+
+async function generateQuizFromKnowledge(title, author, pageRange, previousQuestions, difficulty) {
   const scopeText = pageRange
     ? `They report having read: ${pageRange}.`
     : `They did not specify exact pages, so cover general content from the book.`;
@@ -215,7 +225,7 @@ async function generateQuizFromKnowledge(title, author, pageRange, previousQuest
 
 Using your knowledge of this book, write exactly ${QUESTIONS_PER_QUIZ} multiple-choice reading comprehension questions covering that portion of the book. Every question and its correct answer must be based on content you actually, specifically know from this book — never invent, guess, or generalize plausible-sounding plot details, facts, or figures.
 
-If, being honest, you do not have specific enough knowledge of this book's actual content (this is common for children's non-fiction, workbooks, textbooks, or lesser-known titles even when the book itself is real) — do NOT invent a quiz. Instead respond with exactly: {"insufficient_knowledge": true}${avoidanceClause(previousQuestions)}
+If, being honest, you do not have specific enough knowledge of this book's actual content (this is common for children's non-fiction, workbooks, textbooks, or lesser-known titles even when the book itself is real) — do NOT invent a quiz. Instead respond with exactly: {"insufficient_knowledge": true}${avoidanceClause(previousQuestions)}${difficultyClause(difficulty)}
 
 Otherwise, return ONLY valid JSON, no markdown fences, no preamble, in this exact format:
 [
@@ -235,14 +245,14 @@ Otherwise, return ONLY valid JSON, no markdown fences, no preamble, in this exac
   }
 }
 
-async function generateQuizFromPagePhotos(images, title, previousQuestions) {
+async function generateQuizFromPagePhotos(images, title, previousQuestions, difficulty) {
   const content = images.map((img) => ({
     type: "image",
     source: { type: "base64", media_type: img.mediaType, data: img.base64 },
   }));
   content.push({
     type: "text",
-    text: `These are photos of pages from the book "${title}" that a child has read. Based ONLY on the actual text visible in these photos, write exactly ${QUESTIONS_PER_QUIZ} multiple-choice reading comprehension questions covering this content. If some text is unclear, focus questions on what is clearly readable.${avoidanceClause(previousQuestions)}
+    text: `These are photos of pages from the book "${title}" that a child has read. Based ONLY on the actual text visible in these photos, write exactly ${QUESTIONS_PER_QUIZ} multiple-choice reading comprehension questions covering this content. If some text is unclear, focus questions on what is clearly readable.${avoidanceClause(previousQuestions)}${difficultyClause(difficulty)}
 
 Return ONLY valid JSON, no markdown fences, no preamble, in this exact format:
 [
@@ -325,7 +335,7 @@ async function checkResumeOrPrompt(chatId, userId, child) {
     await updateSession(userId, { mode: "resume_check", quiz_book_title: inProgress.title });
     await sendText(
       chatId,
-      `Welcome back, ${child.name}! You're at page ${inProgress.last_page} of "${inProgress.title}". Have you read up to page ${nextEnd} (the next ${RESUME_PAGE_INCREMENT} pages)? If you've finished the whole book already, tap "I finished this book" below.`,
+      `Welcome back, ${child.name}! You're at page ${inProgress.last_page || 0} of "${inProgress.title}". Have you read up to page ${nextEnd} (the next ${RESUME_PAGE_INCREMENT} pages)? If you've finished the whole book already, tap "I finished this book" below.`,
       resumeKeyboard
     );
     return true;
@@ -341,7 +351,7 @@ async function getActiveChild(session) {
 
 async function getInProgressBook(childId) {
   const rows = await query(
-    "SELECT * FROM books WHERE child_id=$1 AND status='in_progress' AND last_page IS NOT NULL ORDER BY updated_at DESC LIMIT 1",
+    "SELECT * FROM books WHERE child_id=$1 AND status='in_progress' ORDER BY updated_at DESC LIMIT 1",
     [childId]
   );
   return rows[0] || null;
@@ -391,7 +401,7 @@ async function startQuizFromKnownBook(chatId, userId, activeChild, book) {
   if (book.found_online) {
     const nextEnd = (book.last_page || 0) + RESUME_PAGE_INCREMENT;
     const pageRange = `${(book.last_page || 0) + 1}-${nextEnd}`;
-    const questions = await generateQuizFromKnowledge(book.title, book.author, pageRange, previousQuestions);
+    const questions = await generateQuizFromKnowledge(book.title, book.author, pageRange, previousQuestions, activeChild.difficulty);
 
     if (questions === "INSUFFICIENT_KNOWLEDGE") {
       // Downgrade permanently — future sessions for this book skip straight to photos.
@@ -406,11 +416,11 @@ async function startQuizFromKnownBook(chatId, userId, activeChild, book) {
       await updateSession(userId, { mode: "idle" });
       return sendMenu(chatId, "Sorry, I couldn't generate a quiz right now. Please try 🧠 Quiz again.");
     }
-    await upsertBookProgress(activeChild.id, book.title, { pageRangeText: pageRange, lastPage: nextEnd });
     await updateSession(userId, {
       mode: "quiz",
       quiz_book_title: book.title,
       quiz_page_range: pageRange,
+      quiz_pending_last_page: nextEnd,
       quiz_questions_json: JSON.stringify(questions),
       quiz_current_index: 0,
       quiz_correct_count: 0,
@@ -481,6 +491,16 @@ async function handleUpdate(update) {
   }
 
   const activeChild = await getActiveChild(session);
+
+  if (text?.startsWith("/setlevel")) {
+    const level = text.replace("/setlevel", "").trim().toLowerCase();
+    if (!["easy", "medium", "hard"].includes(level)) {
+      return sendText(chatId, 'Usage: /setlevel easy | medium | hard (applies to the currently active child)');
+    }
+    if (!activeChild) return sendText(chatId, "No active child selected. Tap a child's name first (or /use <name>), then try again.");
+    await query("UPDATE children SET difficulty=$1 WHERE id=$2", [level, activeChild.id]);
+    return sendMenu(chatId, `✅ Quiz difficulty for ${activeChild.name} set to "${level}". This applies to their next quiz.`);
+  }
 
   if (text?.startsWith("/status")) {
     if (!activeChild) return sendText(chatId, "No active child. Use /use <name> first.");
@@ -761,13 +781,11 @@ async function handleUpdate(update) {
       author: session.quiz_author,
       foundOnline: true,
       bookType: session.quiz_book_type,
-      pageRangeText: pageRange,
-      lastPage,
     });
 
     await sendText(chatId, "Generating your quiz, one moment...");
     const previousQuestions = await getPreviousQuestions(activeChild.id, session.quiz_book_title);
-    const questions = await generateQuizFromKnowledge(session.quiz_book_title, session.quiz_author, pageRange, previousQuestions);
+    const questions = await generateQuizFromKnowledge(session.quiz_book_title, session.quiz_author, pageRange, previousQuestions, activeChild.difficulty);
 
     if (questions === "INSUFFICIENT_KNOWLEDGE") {
       await query("UPDATE books SET found_online=false WHERE child_id=$1 AND title=$2", [activeChild.id, session.quiz_book_title]);
@@ -784,6 +802,7 @@ async function handleUpdate(update) {
     await updateSession(userId, {
       mode: "quiz",
       quiz_page_range: pageRange,
+      quiz_pending_last_page: lastPage,
       quiz_questions_json: JSON.stringify(questions),
       quiz_current_index: 0,
       quiz_correct_count: 0,
@@ -818,11 +837,10 @@ async function handleUpdate(update) {
       const startPage = (book?.last_page || 0) + 1;
       const endPage = (book?.last_page || 0) + photos.length;
       const pageRangeText = `${startPage}-${endPage}`;
-      await upsertBookProgress(activeChild.id, session.quiz_book_title, { lastPage: endPage, pageRangeText });
 
       await sendText(chatId, "Generating your quiz from those pages, one moment...");
       const previousQuestions = await getPreviousQuestions(activeChild.id, session.quiz_book_title);
-      const questions = await generateQuizFromPagePhotos(photos, session.quiz_book_title, previousQuestions);
+      const questions = await generateQuizFromPagePhotos(photos, session.quiz_book_title, previousQuestions, activeChild.difficulty);
       if (!questions || !questions.length) {
         await updateSession(userId, { mode: "idle", quiz_photos_json: null });
         return sendMenu(chatId, "Sorry, I couldn't generate a quiz from those photos. Please try 🧠 Quiz again.");
@@ -830,6 +848,7 @@ async function handleUpdate(update) {
       await updateSession(userId, {
         mode: "quiz",
         quiz_page_range: pageRangeText,
+        quiz_pending_last_page: endPage,
         quiz_questions_json: JSON.stringify(questions),
         quiz_current_index: 0,
         quiz_correct_count: 0,
@@ -854,23 +873,56 @@ async function handleUpdate(update) {
     if (nextIdx >= questions.length) {
       const scorePercent = Math.round((newCorrectCount / questions.length) * 100);
       const passed = scorePercent >= PASS_THRESHOLD;
+      const currentDifficulty = activeChild.difficulty || "medium";
       const attemptRows = await query(
         "SELECT COUNT(*) as c FROM chapter_records WHERE child_id=$1 AND book_title=$2",
         [activeChild.id, session.quiz_book_title]
       );
       await query(
-        "INSERT INTO chapter_records (child_id, book_title, chapter_number, score_percent, passed, attempt_number, questions_json) VALUES ($1,$2,$3,$4,$5,$6,$7)",
-        [activeChild.id, session.quiz_book_title, 0, scorePercent, passed, Number(attemptRows[0].c) + 1, JSON.stringify(questions)]
+        "INSERT INTO chapter_records (child_id, book_title, chapter_number, score_percent, passed, attempt_number, questions_json, difficulty) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+        [activeChild.id, session.quiz_book_title, 0, scorePercent, passed, Number(attemptRows[0].c) + 1, JSON.stringify(questions), currentDifficulty]
       );
+      // Only advance the child's recorded page position if they actually passed —
+      // otherwise the next resume prompt should offer the SAME range again, not skip ahead.
+      if (passed && session.quiz_pending_last_page) {
+        await upsertBookProgress(activeChild.id, session.quiz_book_title, {
+          lastPage: session.quiz_pending_last_page,
+          pageRangeText: session.quiz_page_range,
+        });
+      }
+
+      // Auto level-up: if the last few attempts at the current difficulty were all
+      // strong passes (regardless of which book), bump difficulty up automatically.
+      let levelUpNote = "";
+      const LEVELS = ["easy", "medium", "hard"];
+      const currentIdx = LEVELS.indexOf(currentDifficulty);
+      if (currentIdx !== -1 && currentIdx < LEVELS.length - 1) {
+        const AUTO_LEVEL_UP_STREAK = 3;
+        const AUTO_LEVEL_UP_SCORE = 90;
+        const recent = await query(
+          "SELECT score_percent FROM chapter_records WHERE child_id=$1 AND difficulty=$2 ORDER BY date DESC LIMIT $3",
+          [activeChild.id, currentDifficulty, AUTO_LEVEL_UP_STREAK]
+        );
+        const strongStreak = recent.length === AUTO_LEVEL_UP_STREAK && recent.every((r) => r.score_percent >= AUTO_LEVEL_UP_SCORE);
+        if (strongStreak) {
+          const newLevel = LEVELS[currentIdx + 1];
+          await query("UPDATE children SET difficulty=$1 WHERE id=$2", [newLevel, activeChild.id]);
+          levelUpNote = `\n\n⬆️ ${activeChild.name} has scored ${AUTO_LEVEL_UP_SCORE}%+ on ${AUTO_LEVEL_UP_STREAK} quizzes in a row — difficulty automatically raised to "${newLevel}"! 🌟`;
+        }
+      }
+
       const scopeLabel = session.quiz_page_range ? `pages ${session.quiz_page_range}` : "the book";
-      const resultMessage = passed
-        ? `🎉 ${activeChild.name} scored ${scorePercent}%! ✅ Passed "${session.quiz_book_title}" (${scopeLabel}).`
-        : `Score: ${scorePercent}%. ❌ Not quite — please re-read "${session.quiz_book_title}" (${scopeLabel}) and try 🧠 Quiz again. (Next attempt will have different questions.)`;
+      const resultMessage =
+        (passed
+          ? `🎉 ${activeChild.name} scored ${scorePercent}%! ✅ Passed "${session.quiz_book_title}" (${scopeLabel}).`
+          : `Score: ${scorePercent}%. ❌ Not quite — please re-read "${session.quiz_book_title}" (${scopeLabel}) and try 🧠 Quiz again. (Next attempt will have different questions.)`) +
+        levelUpNote;
       await updateSession(userId, {
         mode: "book_finished_check",
         quiz_questions_json: null,
         quiz_current_index: 0,
         quiz_correct_count: 0,
+        quiz_pending_last_page: null,
         pending_message: resultMessage,
       });
       return sendText(chatId, `${resultMessage}\n\nDid you finish "${session.quiz_book_title}" completely?`, finishedKeyboard);
