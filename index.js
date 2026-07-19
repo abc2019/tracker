@@ -17,6 +17,7 @@ for (const [name, val] of [
 }
 
 const PASS_THRESHOLD = 80;
+const TARGET_AGE = "10-11 years old (roughly grade 5-6)";
 const QUESTIONS_PER_QUIZ = 8;
 const CLAUDE_MODEL = process.env.CLAUDE_MODEL || "claude-sonnet-5";
 const MIN_PAGES_BIG_BOOK = 5;
@@ -26,10 +27,6 @@ const MENU = {
   WORD: "📖 Word Meaning",
   PASSAGE: "📝 Passage Meaning",
   QUIZ: "🧠 Quiz",
-};
-const BOOK_TYPE = {
-  SMALL: "📕 Small booklet (whole book)",
-  BIG: "📚 Big book (specific pages)",
 };
 const RESUME = {
   YES: "✅ Yes, quiz me",
@@ -45,7 +42,6 @@ const FINISHED = {
 const CHILD_NAMES = ["Hanifa", "Ismail"];
 
 const mainMenuKeyboard = { keyboard: [[MENU.WORD, MENU.PASSAGE], [MENU.QUIZ]], resize_keyboard: true };
-const bookTypeKeyboard = { keyboard: [[BOOK_TYPE.SMALL], [BOOK_TYPE.BIG]], resize_keyboard: true, one_time_keyboard: true };
 const resumeKeyboard = { keyboard: [[RESUME.YES], [RESUME.NOT_YET], [RESUME.FINISHED]], resize_keyboard: true, one_time_keyboard: true };
 const childKeyboard = { keyboard: [CHILD_NAMES], resize_keyboard: true, one_time_keyboard: true };
 const finishedKeyboard = { keyboard: [[FINISHED.YES], [FINISHED.NO]], resize_keyboard: true, one_time_keyboard: true };
@@ -83,20 +79,48 @@ async function getTelegramFileBase64(fileId) {
   return Buffer.from(buf).toString("base64");
 }
 
+// Telegram sends each photo as several sizes, smallest to largest. The largest is often
+// much bigger than needed for reading text and slows down/risks-timing-out the Claude call
+// (especially with several page photos in one request) — the second-largest is still very
+// legible for OCR-style reading while being significantly smaller.
+function pickPhotoSize(photoArray) {
+  if (photoArray.length >= 2) return photoArray[photoArray.length - 2];
+  return photoArray[photoArray.length - 1];
+}
+
 // ---------- Claude API helpers ----------
 
 async function callClaude(messages, maxTokens = 1024, tools = null, attempt = 1) {
   const body = { model: CLAUDE_MODEL, max_tokens: maxTokens, messages };
   if (tools) body.tools = tools;
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-api-key": ANTHROPIC_API_KEY,
-      "anthropic-version": "2023-06-01",
-    },
-    body: JSON.stringify(body),
-  });
+
+  const controller = new AbortController();
+  const timeoutMs = 55000; // hard cap — a stalled connection must not hang the bot forever
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+  let res;
+  try {
+    res = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify(body),
+    });
+  } catch (err) {
+    clearTimeout(timeoutId);
+    const isTimeout = err.name === "AbortError";
+    console.error(`Claude API ${isTimeout ? "TIMED OUT" : "network error"} (attempt ${attempt}):`, err.message);
+    if (attempt < 3) {
+      await new Promise((r) => setTimeout(r, 1500 * attempt));
+      return callClaude(messages, maxTokens, tools, attempt + 1);
+    }
+    return null;
+  }
+  clearTimeout(timeoutId);
+
   const data = await res.json();
   if (data.content) {
     return data.content.map((b) => b.text || "").join("\n").trim();
@@ -118,13 +142,13 @@ async function callClaude(messages, maxTokens = 1024, tools = null, attempt = 1)
 
 async function explainText(text, isPassage) {
   const kind = isPassage ? "passage" : "word";
-  const prompt = `You are a friendly reading tutor for a child. Explain the meaning of the following ${kind} in simple, age-appropriate English. Keep it short (2-5 sentences), use an example if helpful.\n\nText: "${text}"`;
+  const prompt = `You are a friendly reading tutor for a child who is ${TARGET_AGE}. Explain the meaning of the following ${kind} in simple, age-appropriate English for that age group — everyday vocabulary they'd already know, short sentences. Keep it short (2-5 sentences), use an example if helpful.\n\nText: "${text}"`;
   return callClaude([{ role: "user", content: prompt }]);
 }
 
 async function explainImage(base64Image, mediaType, isPassage) {
   const kind = isPassage ? "passage" : "word";
-  const prompt = `You are a friendly reading tutor for a child. Look at this image (a ${kind} from a book). Explain its meaning in simple, age-appropriate English in 2-5 sentences.`;
+  const prompt = `You are a friendly reading tutor for a child who is ${TARGET_AGE}. Look at this image (a ${kind} from a book). Explain its meaning in simple, age-appropriate English for that age group in 2-5 sentences.`;
   return callClaude([
     { role: "user", content: [
       { type: "image", source: { type: "base64", media_type: mediaType, data: base64Image } },
@@ -209,21 +233,21 @@ function avoidanceClause(previousQuestions) {
 
 function difficultyClause(difficulty) {
   if (difficulty === "easy") {
-    return `\n\nIMPORTANT — difficulty level: EASY (young/beginner reader). Use very simple, short sentences for both questions and answer options. Ask only about clear, literal, directly-stated facts (who, what, where, simple sequence of events) — avoid inference, "why," theme, or "what does this suggest" style questions. Keep vocabulary simple and age-appropriate. Make the correct answer clearly distinguishable from the wrong options rather than subtly different.`;
+    return `\n\nIMPORTANT — difficulty level: EASY, below the typical reading level for ${TARGET_AGE} (use this for a child who is still finding quizzes hard). Use very simple, short sentences for both questions and answer options. Ask only about clear, literal, directly-stated facts (who, what, where, simple sequence of events) — avoid inference, "why," theme, or "what does this suggest" style questions. Make the correct answer clearly distinguishable from the wrong options rather than subtly different.`;
   }
   if (difficulty === "hard") {
-    return `\n\nIMPORTANT — difficulty level: HARD (advanced reader). Include some questions that require inference, connecting ideas across the passage, or understanding theme/motivation, not just literal recall.`;
+    return `\n\nIMPORTANT — difficulty level: HARD, above the typical reading level for ${TARGET_AGE} (use this for a child who is consistently acing quizzes at the normal level). Include some questions that require inference, connecting ideas across the passage, or understanding theme/motivation, not just literal recall — but keep the vocabulary itself still readable for this age, only the thinking should be harder.`;
   }
-  return ""; // medium = default balanced difficulty, no special instruction
+  return ""; // medium = the normal difficulty for this age group, no special instruction beyond the base prompt
 }
 
 async function generateQuizFromKnowledge(title, author, pageRange, previousQuestions, difficulty) {
   const scopeText = pageRange
     ? `They report having read: ${pageRange}.`
     : `They did not specify exact pages, so cover general content from the book.`;
-  const prompt = `You are a reading comprehension teacher. A child has been reading the book "${title}"${author ? ` by ${author}` : ""}. ${scopeText}
+  const prompt = `You are a reading comprehension teacher for a child who is ${TARGET_AGE}. They have been reading the book "${title}"${author ? ` by ${author}` : ""}. ${scopeText}
 
-Using your knowledge of this book, write exactly ${QUESTIONS_PER_QUIZ} multiple-choice reading comprehension questions covering that portion of the book. Every question and its correct answer must be based on content you actually, specifically know from this book — never invent, guess, or generalize plausible-sounding plot details, facts, or figures.
+Using your knowledge of this book, write exactly ${QUESTIONS_PER_QUIZ} multiple-choice reading comprehension questions covering that portion of the book. Every question and its correct answer must be based on content you actually, specifically know from this book — never invent, guess, or generalize plausible-sounding plot details, facts, or figures. Phrase every question and answer option in vocabulary and sentence length natural for a ${TARGET_AGE} reader — no advanced or adult-level words where a simpler one works just as well.
 
 If, being honest, you do not have specific enough knowledge of this book's actual content (this is common for children's non-fiction, workbooks, textbooks, or lesser-known titles even when the book itself is real) — do NOT invent a quiz. Instead respond with exactly: {"insufficient_knowledge": true}${avoidanceClause(previousQuestions)}${difficultyClause(difficulty)}
 
@@ -252,7 +276,7 @@ async function generateQuizFromPagePhotos(images, title, previousQuestions, diff
   }));
   content.push({
     type: "text",
-    text: `These are photos of pages from the book "${title}" that a child has read. Based ONLY on the actual text visible in these photos, write exactly ${QUESTIONS_PER_QUIZ} multiple-choice reading comprehension questions covering this content. If some text is unclear, focus questions on what is clearly readable.${avoidanceClause(previousQuestions)}${difficultyClause(difficulty)}
+    text: `These are photos of pages from the book "${title}" that a child who is ${TARGET_AGE} has read. Based ONLY on the actual text visible in these photos, write exactly ${QUESTIONS_PER_QUIZ} multiple-choice reading comprehension questions covering this content. If some text is unclear, focus questions on what is clearly readable. Phrase every question and answer option in vocabulary and sentence length natural for that age — no advanced or adult-level words where a simpler one works just as well.${avoidanceClause(previousQuestions)}${difficultyClause(difficulty)}
 
 Return ONLY valid JSON, no markdown fences, no preamble, in this exact format:
 [
@@ -331,11 +355,12 @@ async function getChildByName(userId, name) {
 async function checkResumeOrPrompt(chatId, userId, child) {
   const inProgress = await getInProgressBook(child.id);
   if (inProgress) {
-    const nextEnd = (inProgress.last_page || 0) + RESUME_PAGE_INCREMENT;
+    const rawNextEnd = (inProgress.last_page || 0) + RESUME_PAGE_INCREMENT;
+    const nextEnd = inProgress.total_pages ? Math.min(rawNextEnd, inProgress.total_pages) : rawNextEnd;
     await updateSession(userId, { mode: "resume_check", quiz_book_title: inProgress.title });
     await sendText(
       chatId,
-      `Welcome back, ${child.name}! You're at page ${inProgress.last_page || 0} of "${inProgress.title}". Have you read up to page ${nextEnd} (the next ${RESUME_PAGE_INCREMENT} pages)? If you've finished the whole book already, tap "I finished this book" below.`,
+      `Welcome back, ${child.name}! You're at page ${inProgress.last_page || 0} of "${inProgress.title}". Have you read up to page ${nextEnd}? If you've finished the whole book already, tap "I finished this book" below.`,
       resumeKeyboard
     );
     return true;
@@ -357,10 +382,10 @@ async function getInProgressBook(childId) {
   return rows[0] || null;
 }
 
-async function upsertBookProgress(childId, title, { author, foundOnline, bookType, pageRangeText, lastPage, totalPages } = {}) {
+async function upsertBookProgress(childId, title, { author, foundOnline, bookType, pageRangeText, lastPage, totalPages, lastPhotosJson } = {}) {
   const rows = await query(
-    `INSERT INTO books (child_id, title, author, found_online, book_type, last_page_range, last_page, total_pages, updated_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+    `INSERT INTO books (child_id, title, author, found_online, book_type, last_page_range, last_page, total_pages, last_photos_json, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
      ON CONFLICT (child_id, title) DO UPDATE SET
        author = COALESCE(EXCLUDED.author, books.author),
        found_online = COALESCE(EXCLUDED.found_online, books.found_online),
@@ -368,6 +393,7 @@ async function upsertBookProgress(childId, title, { author, foundOnline, bookTyp
        last_page_range = COALESCE(EXCLUDED.last_page_range, books.last_page_range),
        last_page = COALESCE(EXCLUDED.last_page, books.last_page),
        total_pages = COALESCE(EXCLUDED.total_pages, books.total_pages),
+       last_photos_json = CASE WHEN $9 IS NOT NULL OR $10 THEN $9 ELSE books.last_photos_json END,
        status = CASE
          WHEN COALESCE(EXCLUDED.total_pages, books.total_pages) IS NOT NULL
               AND COALESCE(EXCLUDED.last_page, books.last_page) >= COALESCE(EXCLUDED.total_pages, books.total_pages)
@@ -376,7 +402,18 @@ async function upsertBookProgress(childId, title, { author, foundOnline, bookTyp
        END,
        updated_at = NOW()
      RETURNING status`,
-    [childId, title, author || null, foundOnline ?? null, bookType || null, pageRangeText || null, lastPage ?? null, totalPages ?? null]
+    [
+      childId,
+      title,
+      author || null,
+      foundOnline ?? null,
+      bookType || null,
+      pageRangeText || null,
+      lastPage ?? null,
+      totalPages ?? null,
+      lastPhotosJson === undefined ? null : lastPhotosJson,
+      lastPhotosJson === null, // explicit-clear flag: true only when caller passed null on purpose
+    ]
   );
   return rows[0]?.status || "in_progress";
 }
@@ -384,12 +421,12 @@ async function upsertBookProgress(childId, title, { author, foundOnline, bookTyp
 // ---------- Webhook route ----------
 
 app.post("/webhook", async (req, res) => {
+  res.sendStatus(200); // ack Telegram immediately so it doesn't retry/duplicate the update
   try {
     await handleUpdate(req.body);
   } catch (err) {
     console.error("Error handling update:", err);
   }
-  res.sendStatus(200);
 });
 
 app.get("/", (req, res) => res.send("Reading Tracker Bot is running."));
@@ -397,19 +434,23 @@ app.get("/", (req, res) => res.send("Reading Tracker Bot is running."));
 async function startQuizFromKnownBook(chatId, userId, activeChild, book) {
   await sendText(chatId, "Great! Generating your quiz, one moment...");
   const previousQuestions = await getPreviousQuestions(activeChild.id, book.title);
+  const totalPages = book.total_pages || null;
+  const priorLastPage = book.last_page || 0;
 
   if (book.found_online) {
-    const nextEnd = (book.last_page || 0) + RESUME_PAGE_INCREMENT;
-    const pageRange = `${(book.last_page || 0) + 1}-${nextEnd}`;
+    const rawNextEnd = priorLastPage + RESUME_PAGE_INCREMENT;
+    const nextEnd = totalPages ? Math.min(rawNextEnd, totalPages) : rawNextEnd;
+    const pageRange = `${priorLastPage + 1}-${nextEnd}`;
     const questions = await generateQuizFromKnowledge(book.title, book.author, pageRange, previousQuestions, activeChild.difficulty);
 
     if (questions === "INSUFFICIENT_KNOWLEDGE") {
       // Downgrade permanently — future sessions for this book skip straight to photos.
       await query("UPDATE books SET found_online=false WHERE id=$1", [book.id]);
+      const requiredPhotos = totalPages ? Math.max(1, Math.min(MIN_PAGES_BIG_BOOK, totalPages - priorLastPage)) : MIN_PAGES_BIG_BOOK;
       await updateSession(userId, { mode: "quiz_collecting_photos", quiz_book_title: book.title, quiz_photos_json: "[]" });
       return sendText(
         chatId,
-        `I don't know this book's specific content well enough, so I won't guess. Please send photos of the next pages you've read (at least ${MIN_PAGES_BIG_BOOK} pages). Type "done" when finished.`
+        `I don't know this book's specific content well enough, so I won't guess. Please send photos of the next pages you've read (at least ${requiredPhotos} page${requiredPhotos > 1 ? "s" : ""}). Type "done" when finished.`
       );
     }
     if (!questions || !questions.length) {
@@ -427,6 +468,30 @@ async function startQuizFromKnownBook(chatId, userId, activeChild, book) {
     });
     return askQuizQuestion(chatId, questions, 0);
   } else {
+    const storedPhotos = book.last_photos_json ? JSON.parse(book.last_photos_json) : null;
+    if (storedPhotos && storedPhotos.length) {
+      // This page range was attempted before but not passed — regenerate fresh questions
+      // from the SAME photos rather than asking the child to re-photograph the pages.
+      const startPage = priorLastPage + 1;
+      const endPage = totalPages ? Math.min(priorLastPage + storedPhotos.length, totalPages) : priorLastPage + storedPhotos.length;
+      const pageRangeText = `${startPage}-${endPage}`;
+      const questions = await generateQuizFromPagePhotos(storedPhotos, book.title, previousQuestions, activeChild.difficulty);
+      if (!questions || !questions.length) {
+        await updateSession(userId, { mode: "idle" });
+        return sendMenu(chatId, "Sorry, I couldn't generate a quiz right now. Please try 🧠 Quiz again.");
+      }
+      await updateSession(userId, {
+        mode: "quiz",
+        quiz_book_title: book.title,
+        quiz_page_range: pageRangeText,
+        quiz_pending_last_page: endPage,
+        quiz_questions_json: JSON.stringify(questions),
+        quiz_current_index: 0,
+        quiz_correct_count: 0,
+      });
+      return askQuizQuestion(chatId, questions, 0);
+    }
+    const requiredPhotos = totalPages ? Math.max(1, Math.min(MIN_PAGES_BIG_BOOK, totalPages - priorLastPage)) : MIN_PAGES_BIG_BOOK;
     await updateSession(userId, {
       mode: "quiz_collecting_photos",
       quiz_book_title: book.title,
@@ -434,9 +499,46 @@ async function startQuizFromKnownBook(chatId, userId, activeChild, book) {
     });
     return sendText(
       chatId,
-      `Please send photos of the next pages you've read, one by one (at least ${MIN_PAGES_BIG_BOOK} pages). Type "done" when finished.`
+      `Please send photos of the next pages you've read, one by one (at least ${requiredPhotos} page${requiredPhotos > 1 ? "s" : ""}). Type "done" when finished.`
     );
   }
+}
+
+async function proceedPastTotalPages(chatId, userId, childId, bookTitle, found) {
+  const rows = await query("SELECT total_pages FROM books WHERE child_id=$1 AND title=$2", [childId, bookTitle]);
+  const totalPages = rows[0]?.total_pages || null;
+  if (found) {
+    await updateSession(userId, { mode: "quiz_awaiting_pages" });
+    const hint = totalPages ? ` (this book has ${totalPages} pages total)` : "";
+    return sendText(chatId, `"${bookTitle}" — which pages have you read?${hint}`);
+  } else {
+    const requiredPhotos = totalPages ? Math.min(MIN_PAGES_BIG_BOOK, totalPages) : MIN_PAGES_BIG_BOOK;
+    await updateSession(userId, { mode: "quiz_collecting_photos", quiz_photos_json: "[]" });
+    return sendText(
+      chatId,
+      `Now send photos of the pages you've read, one by one (at least ${requiredPhotos} page${requiredPhotos > 1 ? "s" : ""}). Type "done" when finished.`
+    );
+  }
+}
+
+// Verifies the child has actually passed quizzes covering the whole book (based on the
+// total page count recorded when the book was added) before marking it finished.
+async function confirmBookFinished(chatId, userId, activeChild, bookTitle) {
+  const rows = await query("SELECT * FROM books WHERE child_id=$1 AND title=$2", [activeChild.id, bookTitle]);
+  const book = rows[0];
+  await updateSession(userId, { mode: "idle", pending_message: null });
+  if (!book) {
+    return sendMenu(chatId, "Hmm, I lost track of that book. Please use 🧠 Quiz to start again.");
+  }
+  const lastPage = book.last_page || 0;
+  if (book.total_pages && lastPage < book.total_pages) {
+    return sendMenu(
+      chatId,
+      `Not quite yet — ${activeChild.name} has only passed quizzes up through page ${lastPage} of ${book.total_pages} total pages in "${bookTitle}". Let's finish quizzing the rest first — tap 🧠 Quiz to continue from where you left off.`
+    );
+  }
+  await query("UPDATE books SET status='finished', updated_at=NOW() WHERE id=$1", [book.id]);
+  return sendMenu(chatId, `🏁 "${bookTitle}" marked as finished. Great job, ${activeChild.name}! 🎉`);
 }
 
 async function handleUpdate(update) {
@@ -563,8 +665,8 @@ async function handleUpdate(update) {
 
       if (pending === MENU.QUIZ) {
         if (!(await checkResumeOrPrompt(chatId, userId, child))) {
-          await updateSession(userId, { mode: "quiz_choose_type" });
-          await sendText(chatId, "Is this a small booklet (whole book) or a big book (specific pages)?", bookTypeKeyboard);
+          await updateSession(userId, { mode: "quiz_awaiting_cover" });
+          await sendText(chatId, "📷 Send a photo of the book's cover.", { remove_keyboard: true });
         }
         return;
       }
@@ -600,9 +702,7 @@ async function handleUpdate(update) {
       return sendMenu(chatId, "No problem — keep reading! Come back when you're ready. 📖");
     }
     if (text === RESUME.FINISHED) {
-      await query("UPDATE books SET status='finished', updated_at=NOW() WHERE child_id=$1 AND title=$2", [activeChild.id, session.quiz_book_title]);
-      await updateSession(userId, { mode: "idle" });
-      return sendMenu(chatId, `🏁 "${session.quiz_book_title}" marked as finished. Great job, ${activeChild.name}! 🎉`);
+      return confirmBookFinished(chatId, userId, activeChild, session.quiz_book_title);
     }
     return sendText(chatId, "Please tap one of the options above.", resumeKeyboard);
   }
@@ -639,8 +739,8 @@ async function handleUpdate(update) {
 
   if (session.mode === "awaiting_passage") {
     if (message.photo) {
-      const largestPhoto = message.photo[message.photo.length - 1];
-      const base64 = await getTelegramFileBase64(largestPhoto.file_id);
+      const selectedPhoto = pickPhotoSize(message.photo);
+      const base64 = await getTelegramFileBase64(selectedPhoto.file_id);
       const quality = await checkImageReadable(base64, "image/jpeg", "a passage from a book");
       if (!quality.readable) {
         return sendText(chatId, `📷 That photo isn't clear enough to read${quality.reason ? ` (${quality.reason})` : ""}. Please retake it and send again.`);
@@ -664,6 +764,7 @@ async function handleUpdate(update) {
       await updateSession(userId, { mode: "idle" });
       return sendMenu(chatId, explanation);
     }
+    return sendText(chatId, "Please send the passage as text, or a photo of it.");
   }
 
   if (session.mode === "quiz_awaiting_name" && text) {
@@ -675,24 +776,15 @@ async function handleUpdate(update) {
     await updateSession(userId, { active_child_id: quizChild.id, mode: "idle" });
 
     if (!(await checkResumeOrPrompt(chatId, userId, quizChild))) {
-      await updateSession(userId, { mode: "quiz_choose_type" });
-      return sendText(chatId, "Is this a small booklet (whole book) or a big book (specific pages)?", bookTypeKeyboard);
+      await updateSession(userId, { mode: "quiz_awaiting_cover" });
+      return sendText(chatId, "📷 Send a photo of the book's cover.", { remove_keyboard: true });
     }
     return;
   }
 
-  if (session.mode === "quiz_choose_type") {
-    if (text === BOOK_TYPE.SMALL || text === BOOK_TYPE.BIG) {
-      const bookType = text === BOOK_TYPE.SMALL ? "small" : "big";
-      await updateSession(userId, { mode: "quiz_awaiting_cover", quiz_book_type: bookType });
-      return sendText(chatId, "📷 Send a photo of the book's cover.", { remove_keyboard: true });
-    }
-    return sendText(chatId, "Please tap one of the two options above.", bookTypeKeyboard);
-  }
-
   if (session.mode === "quiz_awaiting_cover" && message.photo) {
-    const largestPhoto = message.photo[message.photo.length - 1];
-    const base64 = await getTelegramFileBase64(largestPhoto.file_id);
+    const selectedPhoto = pickPhotoSize(message.photo);
+    const base64 = await getTelegramFileBase64(selectedPhoto.file_id);
     const quality = await checkImageReadable(base64, "image/jpeg", "a book cover");
     if (!quality.readable) {
       return sendText(chatId, `📷 That photo isn't clear enough to read${quality.reason ? ` (${quality.reason})` : ""}. Please retake it in good light and send again.`);
@@ -726,14 +818,12 @@ async function handleUpdate(update) {
       quiz_found: found,
     });
 
-    if (found) {
-      await updateSession(userId, { mode: "quiz_awaiting_pages" });
-      const hint = session.quiz_book_type === "big" ? ` (please read at least ${MIN_PAGES_BIG_BOOK} pages, e.g. "10-20")` : "";
-      return sendText(chatId, `"${finalTitle}" — which pages have you read?${hint}`);
-    } else {
-      await updateSession(userId, { mode: "quiz_awaiting_total_pages" });
-      return sendText(chatId, `I couldn't find "${finalTitle}" online. How many pages does this book have in total?`);
+    if (existing[0]?.total_pages) {
+      // Already know the page count from a previous session — skip straight ahead.
+      return proceedPastTotalPages(chatId, userId, activeChild.id, finalTitle, found);
     }
+    await updateSession(userId, { mode: "quiz_awaiting_total_pages" });
+    return sendText(chatId, `How many pages does "${finalTitle}" have in total? (So I can track progress and know when it's really finished.)`);
   }
 
   if (session.mode === "quiz_awaiting_total_pages" && text) {
@@ -743,44 +833,35 @@ async function handleUpdate(update) {
     }
     await upsertBookProgress(activeChild.id, session.quiz_book_title, {
       author: session.quiz_author,
-      foundOnline: false,
-      bookType: session.quiz_book_type,
+      foundOnline: session.quiz_found,
       totalPages,
     });
-    await updateSession(userId, { mode: "quiz_collecting_photos", quiz_photos_json: "[]" });
-    return sendText(
-      chatId,
-      `Thanks! Now send photos of the pages you've read, one by one (at least ${MIN_PAGES_BIG_BOOK} pages). Type "done" when finished.`
-    );
+    return proceedPastTotalPages(chatId, userId, activeChild.id, session.quiz_book_title, session.quiz_found);
   }
 
   if (session.mode === "quiz_awaiting_pages" && text) {
-    const range = parsePageRange(text);
-    let pageRange = null;
-    let lastPage = null;
+    const bookRows = await query("SELECT total_pages, last_page FROM books WHERE child_id=$1 AND title=$2", [activeChild.id, session.quiz_book_title]);
+    const totalPages = bookRows[0]?.total_pages || null;
+    const priorLastPage = bookRows[0]?.last_page || 0;
+    const remaining = totalPages ? totalPages - priorLastPage : null;
+    const requiredSpan = remaining !== null ? Math.max(1, Math.min(MIN_PAGES_BIG_BOOK, remaining)) : MIN_PAGES_BIG_BOOK;
 
-    if (session.quiz_book_type === "big") {
-      if (!range || range.span === null) {
-        return sendText(chatId, `Please enter a page range like "10-20" — at least ${MIN_PAGES_BIG_BOOK} pages.`);
-      }
-      if (range.span < MIN_PAGES_BIG_BOOK) {
-        return sendText(chatId, `That's only ${range.span} page(s). For a big book, please read and enter at least ${MIN_PAGES_BIG_BOOK} pages (e.g. "10-20").`);
-      }
-      pageRange = text;
-      lastPage = range.end;
-    } else {
-      if (!range) {
-        await sendText(chatId, "That doesn't look like a valid page number — skipping that and quizzing on the book generally.");
-      } else {
-        pageRange = text;
-        lastPage = range.end;
-      }
+    const range = parsePageRange(text);
+    if (!range || range.span === null) {
+      return sendText(chatId, `Please enter a page range like "10-20"${requiredSpan > 1 ? ` — at least ${requiredSpan} pages` : ""}.`);
     }
+    if (range.span < requiredSpan) {
+      return sendText(chatId, `That's only ${range.span} page(s). Please read and enter at least ${requiredSpan} pages (e.g. "10-20").`);
+    }
+    if (totalPages && range.end > totalPages) {
+      return sendText(chatId, `"${session.quiz_book_title}" only has ${totalPages} pages total — please enter a range up to page ${totalPages}.`);
+    }
+    const pageRange = text;
+    const lastPage = range.end;
 
     await upsertBookProgress(activeChild.id, session.quiz_book_title, {
       author: session.quiz_author,
       foundOnline: true,
-      bookType: session.quiz_book_type,
     });
 
     await sendText(chatId, "Generating your quiz, one moment...");
@@ -789,11 +870,8 @@ async function handleUpdate(update) {
 
     if (questions === "INSUFFICIENT_KNOWLEDGE") {
       await query("UPDATE books SET found_online=false WHERE child_id=$1 AND title=$2", [activeChild.id, session.quiz_book_title]);
-      await updateSession(userId, { mode: "quiz_awaiting_total_pages" });
-      return sendText(
-        chatId,
-        `I don't know this book's specific content well enough, so I won't guess. How many pages does "${session.quiz_book_title}" have in total?`
-      );
+      await sendText(chatId, `I don't know this book's specific content well enough, so I won't guess.`);
+      return proceedPastTotalPages(chatId, userId, activeChild.id, session.quiz_book_title, false);
     }
     if (!questions || !questions.length) {
       await updateSession(userId, { mode: "idle" });
@@ -812,8 +890,8 @@ async function handleUpdate(update) {
 
   if (session.mode === "quiz_collecting_photos") {
     if (message.photo) {
-      const largestPhoto = message.photo[message.photo.length - 1];
-      const base64 = await getTelegramFileBase64(largestPhoto.file_id);
+      const selectedPhoto = pickPhotoSize(message.photo);
+      const base64 = await getTelegramFileBase64(selectedPhoto.file_id);
       const quality = await checkImageReadable(base64, "image/jpeg", "a page from a book");
       if (!quality.readable) {
         return sendText(chatId, `📷 That page isn't clear enough to read${quality.reason ? ` (${quality.reason})` : ""}. Please retake the photo (good light, hold steady, fill the frame) and send it again.`);
@@ -825,17 +903,22 @@ async function handleUpdate(update) {
     }
     if (text && text.toLowerCase() === "done") {
       const photos = JSON.parse(session.quiz_photos_json || "[]");
-      if (photos.length < MIN_PAGES_BIG_BOOK) {
+      const books = await query("SELECT * FROM books WHERE child_id=$1 AND title=$2", [activeChild.id, session.quiz_book_title]);
+      const book = books[0];
+      const totalPages = book?.total_pages || null;
+      const priorLastPage = book?.last_page || 0;
+      const remaining = totalPages ? totalPages - priorLastPage : null;
+      const requiredPhotos = remaining !== null ? Math.max(1, Math.min(MIN_PAGES_BIG_BOOK, remaining)) : MIN_PAGES_BIG_BOOK;
+
+      if (photos.length < requiredPhotos) {
         return sendText(
           chatId,
-          `At least ${MIN_PAGES_BIG_BOOK} page photos are needed (you've sent ${photos.length} so far). Please send more.`
+          `At least ${requiredPhotos} page photo${requiredPhotos > 1 ? "s are" : " is"} needed (you've sent ${photos.length} so far). Please send more.`
         );
       }
 
-      const books = await query("SELECT * FROM books WHERE child_id=$1 AND title=$2", [activeChild.id, session.quiz_book_title]);
-      const book = books[0];
-      const startPage = (book?.last_page || 0) + 1;
-      const endPage = (book?.last_page || 0) + photos.length;
+      const startPage = priorLastPage + 1;
+      const endPage = totalPages ? Math.min(priorLastPage + photos.length, totalPages) : priorLastPage + photos.length;
       const pageRangeText = `${startPage}-${endPage}`;
 
       await sendText(chatId, "Generating your quiz from those pages, one moment...");
@@ -845,6 +928,9 @@ async function handleUpdate(update) {
         await updateSession(userId, { mode: "idle", quiz_photos_json: null });
         return sendMenu(chatId, "Sorry, I couldn't generate a quiz from those photos. Please try 🧠 Quiz again.");
       }
+      // Save the photos on the book itself (not just the session) — if the child fails this
+      // quiz, we can regenerate fresh questions from the SAME photos without re-asking for them.
+      await upsertBookProgress(activeChild.id, session.quiz_book_title, { lastPhotosJson: JSON.stringify(photos) });
       await updateSession(userId, {
         mode: "quiz",
         quiz_page_range: pageRangeText,
@@ -856,7 +942,7 @@ async function handleUpdate(update) {
       });
       return askQuizQuestion(chatId, questions, 0);
     }
-    return sendText(chatId, `Send a page photo, or type 'done' when finished (at least ${MIN_PAGES_BIG_BOOK} pages needed).`);
+    return sendText(chatId, `Send a page photo, or type 'done' when finished (at least ${MIN_PAGES_BIG_BOOK} pages usually needed).`);
   }
 
   if (session.mode === "quiz" && text) {
@@ -888,6 +974,7 @@ async function handleUpdate(update) {
         await upsertBookProgress(activeChild.id, session.quiz_book_title, {
           lastPage: session.quiz_pending_last_page,
           pageRangeText: session.quiz_page_range,
+          lastPhotosJson: null, // this range is done — next attempt (if any) needs fresh photos
         });
       }
 
@@ -933,14 +1020,13 @@ async function handleUpdate(update) {
   }
 
   if (session.mode === "book_finished_check") {
-    if (text === FINISHED.YES || text === FINISHED.NO) {
-      await query(
-        "UPDATE books SET status=$1, updated_at=NOW() WHERE child_id=$2 AND title=$3",
-        [text === FINISHED.YES ? "finished" : "in_progress", activeChild.id, session.quiz_book_title]
-      );
+    if (text === FINISHED.YES) {
+      return confirmBookFinished(chatId, userId, activeChild, session.quiz_book_title);
+    }
+    if (text === FINISHED.NO) {
+      await query("UPDATE books SET status='in_progress', updated_at=NOW() WHERE child_id=$1 AND title=$2", [activeChild.id, session.quiz_book_title]);
       await updateSession(userId, { mode: "idle", pending_message: null });
-      const confirmLine = text === FINISHED.YES ? `🏁 "${session.quiz_book_title}" marked as finished. Great job!` : "Great, keep going! 📖";
-      return sendMenu(chatId, confirmLine);
+      return sendMenu(chatId, "Great, keep going! 📖");
     }
     return sendText(chatId, "Please choose one of the buttons below:", finishedKeyboard);
   }
