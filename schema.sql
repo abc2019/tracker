@@ -8,6 +8,8 @@ CREATE TABLE IF NOT EXISTS children (
   UNIQUE(telegram_user_id, name)
 );
 
+ALTER TABLE children ADD COLUMN IF NOT EXISTS difficulty TEXT DEFAULT 'medium';
+
 CREATE TABLE IF NOT EXISTS sessions (
   telegram_user_id TEXT PRIMARY KEY,
   active_child_id INTEGER,
@@ -28,6 +30,7 @@ ALTER TABLE sessions ADD COLUMN IF NOT EXISTS quiz_page_range TEXT;
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS quiz_photos_json TEXT;
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS pending_action TEXT;
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS pending_message TEXT;
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS quiz_pending_last_page INTEGER;
 
 CREATE TABLE IF NOT EXISTS books (
   id SERIAL PRIMARY KEY,
@@ -45,6 +48,7 @@ ALTER TABLE books ADD COLUMN IF NOT EXISTS found_online BOOLEAN;
 ALTER TABLE books ADD COLUMN IF NOT EXISTS book_type TEXT;
 ALTER TABLE books ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW();
 ALTER TABLE books ADD COLUMN IF NOT EXISTS total_pages INTEGER;
+ALTER TABLE books ADD COLUMN IF NOT EXISTS last_photos_json TEXT;
 
 CREATE TABLE IF NOT EXISTS chapter_records (
   id SERIAL PRIMARY KEY,
@@ -56,6 +60,8 @@ CREATE TABLE IF NOT EXISTS chapter_records (
   attempt_number INTEGER DEFAULT 1,
   date TIMESTAMP DEFAULT NOW()
 );
+
+ALTER TABLE chapter_records ADD COLUMN IF NOT EXISTS difficulty TEXT DEFAULT 'medium';
 
 ALTER TABLE chapter_records ADD COLUMN IF NOT EXISTS questions_json TEXT;
 
