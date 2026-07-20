@@ -16,12 +16,21 @@ for (const [name, val] of [
   console.log(val ? `✅ ${name} is set` : `❌ ${name} is MISSING — check your .env file or environment variables`);
 }
 
-const PASS_THRESHOLD = 80;
+// Safety nets: log and keep running instead of letting the whole bot crash or hang on a
+// transient/unexpected error (e.g. a rejected promise nobody awaited).
+process.on("unhandledRejection", (reason) => {
+  console.error("Unhandled promise rejection (handled, not crashing):", reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error("Uncaught exception (handled, not crashing):", err);
+});
+
+const PASS_THRESHOLD = 70;
 const TARGET_AGE = "10-11 years old (roughly grade 5-6)";
-const QUESTIONS_PER_QUIZ = 8;
+const QUESTIONS_PER_QUIZ = 10;
 const CLAUDE_MODEL = process.env.CLAUDE_MODEL || "claude-sonnet-5";
 const MIN_PAGES_BIG_BOOK = 5;
-const RESUME_PAGE_INCREMENT = 10;
+const RESUME_PAGE_INCREMENT = 5;
 
 const MENU = {
   WORD: "📖 Word Meaning",
@@ -48,12 +57,31 @@ const finishedKeyboard = { keyboard: [[FINISHED.YES], [FINISHED.NO]], resize_key
 
 // ---------- Telegram helpers ----------
 
+// Generic timeout wrapper — ANY outbound network call in this bot must go through
+// something like this. A stalled connection (Telegram, Claude, anything) must never be
+// able to hang the whole bot indefinitely.
+async function fetchWithTimeout(url, options = {}, timeoutMs = 25000) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
 async function tg(method, params) {
-  const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${method}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(params),
-  });
+  let res;
+  try {
+    res = await fetchWithTimeout(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${method}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(params),
+    });
+  } catch (err) {
+    console.error(`Telegram API call to ${method} failed/timed out:`, err.message);
+    return { ok: false, error: err.message };
+  }
   const data = await res.json();
   if (!data.ok) {
     console.error(`Telegram API error on ${method}:`, JSON.stringify(data), "params:", JSON.stringify(params));
@@ -73,8 +101,9 @@ function sendMenu(chatId, text) {
 
 async function getTelegramFileBase64(fileId) {
   const fileInfo = await tg("getFile", { file_id: fileId });
-  const filePath = fileInfo.result.file_path;
-  const fileRes = await fetch(`https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${filePath}`);
+  const filePath = fileInfo?.result?.file_path;
+  if (!filePath) throw new Error("Could not get file path from Telegram");
+  const fileRes = await fetchWithTimeout(`https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${filePath}`, {}, 25000);
   const buf = await fileRes.arrayBuffer();
   return Buffer.from(buf).toString("base64");
 }
@@ -95,7 +124,7 @@ async function callClaude(messages, maxTokens = 1024, tools = null, attempt = 1)
   if (tools) body.tools = tools;
 
   const controller = new AbortController();
-  const timeoutMs = 55000; // hard cap — a stalled connection must not hang the bot forever
+  const timeoutMs = 75000; // hard cap — a stalled connection must not hang the bot forever
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
   let res;
@@ -108,6 +137,7 @@ async function callClaude(messages, maxTokens = 1024, tools = null, attempt = 1)
         "anthropic-version": "2023-06-01",
       },
       body: JSON.stringify(body),
+      signal: controller.signal,
     });
   } catch (err) {
     clearTimeout(timeoutId);
@@ -541,6 +571,37 @@ async function confirmBookFinished(chatId, userId, activeChild, bookTitle) {
   return sendMenu(chatId, `🏁 "${bookTitle}" marked as finished. Great job, ${activeChild.name}! 🎉`);
 }
 
+async function finishPhotoQuiz(chatId, userId, activeChild, session, photos) {
+  const books = await query("SELECT total_pages, last_page FROM books WHERE child_id=$1 AND title=$2", [activeChild.id, session.quiz_book_title]);
+  const book = books[0];
+  const totalPages = book?.total_pages || null;
+  const priorLastPage = book?.last_page || 0;
+  const startPage = priorLastPage + 1;
+  const endPage = totalPages ? Math.min(priorLastPage + photos.length, totalPages) : priorLastPage + photos.length;
+  const pageRangeText = `${startPage}-${endPage}`;
+
+  await sendText(chatId, "Got all the pages — generating your quiz now, one moment...");
+  const previousQuestions = await getPreviousQuestions(activeChild.id, session.quiz_book_title);
+  const questions = await generateQuizFromPagePhotos(photos, session.quiz_book_title, previousQuestions, activeChild.difficulty);
+  if (!questions || !questions.length) {
+    await updateSession(userId, { mode: "idle", quiz_photos_json: null });
+    return sendMenu(chatId, "Sorry, I couldn't generate a quiz from those photos. Please try 🧠 Quiz again.");
+  }
+  // Save the photos on the book itself (not just the session) — if the child fails this
+  // quiz, we can regenerate fresh questions from the SAME photos without re-asking for them.
+  await upsertBookProgress(activeChild.id, session.quiz_book_title, { lastPhotosJson: JSON.stringify(photos) });
+  await updateSession(userId, {
+    mode: "quiz",
+    quiz_page_range: pageRangeText,
+    quiz_pending_last_page: endPage,
+    quiz_questions_json: JSON.stringify(questions),
+    quiz_current_index: 0,
+    quiz_correct_count: 0,
+    quiz_photos_json: null,
+  });
+  return askQuizQuestion(chatId, questions, 0);
+}
+
 async function handleUpdate(update) {
   const message = update.message;
   if (!message) return;
@@ -899,11 +960,24 @@ async function handleUpdate(update) {
       const photos = JSON.parse(session.quiz_photos_json || "[]");
       photos.push({ base64, mediaType: "image/jpeg" });
       await updateSession(userId, { quiz_photos_json: JSON.stringify(photos) });
-      return sendText(chatId, `Got it (${photos.length} page${photos.length > 1 ? "s" : ""} so far). Send more, or type 'done'.`);
+
+      const books = await query("SELECT total_pages, last_page FROM books WHERE child_id=$1 AND title=$2", [activeChild.id, session.quiz_book_title]);
+      const book = books[0];
+      const totalPages = book?.total_pages || null;
+      const priorLastPage = book?.last_page || 0;
+      const remaining = totalPages ? totalPages - priorLastPage : null;
+      const requiredPhotos = remaining !== null ? Math.max(1, Math.min(MIN_PAGES_BIG_BOOK, remaining)) : MIN_PAGES_BIG_BOOK;
+
+      if (photos.length >= requiredPhotos) {
+        // Got exactly what's needed for this round — start generating right away,
+        // no need to wait for the child to type "done".
+        return finishPhotoQuiz(chatId, userId, activeChild, session, photos);
+      }
+      return sendText(chatId, `Got it (${photos.length}/${requiredPhotos} pages). Send ${requiredPhotos - photos.length} more.`);
     }
     if (text && text.toLowerCase() === "done") {
       const photos = JSON.parse(session.quiz_photos_json || "[]");
-      const books = await query("SELECT * FROM books WHERE child_id=$1 AND title=$2", [activeChild.id, session.quiz_book_title]);
+      const books = await query("SELECT total_pages, last_page FROM books WHERE child_id=$1 AND title=$2", [activeChild.id, session.quiz_book_title]);
       const book = books[0];
       const totalPages = book?.total_pages || null;
       const priorLastPage = book?.last_page || 0;
@@ -916,31 +990,7 @@ async function handleUpdate(update) {
           `At least ${requiredPhotos} page photo${requiredPhotos > 1 ? "s are" : " is"} needed (you've sent ${photos.length} so far). Please send more.`
         );
       }
-
-      const startPage = priorLastPage + 1;
-      const endPage = totalPages ? Math.min(priorLastPage + photos.length, totalPages) : priorLastPage + photos.length;
-      const pageRangeText = `${startPage}-${endPage}`;
-
-      await sendText(chatId, "Generating your quiz from those pages, one moment...");
-      const previousQuestions = await getPreviousQuestions(activeChild.id, session.quiz_book_title);
-      const questions = await generateQuizFromPagePhotos(photos, session.quiz_book_title, previousQuestions, activeChild.difficulty);
-      if (!questions || !questions.length) {
-        await updateSession(userId, { mode: "idle", quiz_photos_json: null });
-        return sendMenu(chatId, "Sorry, I couldn't generate a quiz from those photos. Please try 🧠 Quiz again.");
-      }
-      // Save the photos on the book itself (not just the session) — if the child fails this
-      // quiz, we can regenerate fresh questions from the SAME photos without re-asking for them.
-      await upsertBookProgress(activeChild.id, session.quiz_book_title, { lastPhotosJson: JSON.stringify(photos) });
-      await updateSession(userId, {
-        mode: "quiz",
-        quiz_page_range: pageRangeText,
-        quiz_pending_last_page: endPage,
-        quiz_questions_json: JSON.stringify(questions),
-        quiz_current_index: 0,
-        quiz_correct_count: 0,
-        quiz_photos_json: null,
-      });
-      return askQuizQuestion(chatId, questions, 0);
+      return finishPhotoQuiz(chatId, userId, activeChild, session, photos);
     }
     return sendText(chatId, `Send a page photo, or type 'done' when finished (at least ${MIN_PAGES_BIG_BOOK} pages usually needed).`);
   }
